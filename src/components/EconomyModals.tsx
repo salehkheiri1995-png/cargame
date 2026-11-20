@@ -32,6 +32,7 @@ interface ShopModalProps {
   onRestorePurchases: () => void;
   onBack: () => void;
   statusMessage: string | null;
+  purchasePending?: boolean;
 }
 
 export const ShopModal: React.FC<ShopModalProps> = ({
@@ -42,6 +43,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({
   onRestorePurchases,
   onBack,
   statusMessage,
+  purchasePending = false,
 }) => {
   const BackIcon = lang === 'fa' ? ArrowRight : ArrowLeft;
   const [confirmProduct, setConfirmProduct] = useState<ShopProduct | null>(null);
@@ -121,7 +123,8 @@ export const ShopModal: React.FC<ShopModalProps> = ({
           </div>
           <button
             onClick={onWatchFreeCoinsAd}
-            className="arcade-btn px-5 py-2.5 rounded-xl bg-gradient-to-b from-amber-400 to-orange-500 border-2 border-yellow-200 text-slate-950 font-black text-sm cursor-pointer"
+            disabled={purchasePending}
+            className="arcade-btn px-5 py-2.5 rounded-xl bg-gradient-to-b from-amber-400 to-orange-500 border-2 border-yellow-200 text-slate-950 font-black text-sm cursor-pointer disabled:opacity-60"
           >
             +100 {t(lang, 'coins')}
           </button>
@@ -154,7 +157,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({
                 </div>
 
                 <button
-                  disabled={owned}
+                  disabled={owned || purchasePending}
                   onClick={() => setConfirmProduct(product)}
                   className={`arcade-btn w-full py-3 rounded-xl border-2 font-black text-sm flex items-center justify-center gap-2 cursor-pointer ${
                     owned
@@ -221,13 +224,19 @@ export const ShopModal: React.FC<ShopModalProps> = ({
               </button>
               <button
                 onClick={() => {
+                  if (purchasePending) return;
                   const chosen = confirmProduct;
                   setConfirmProduct(null);
                   onStartPurchase(chosen);
                 }}
-                className="arcade-btn py-2.5 rounded-xl bg-gradient-to-b from-emerald-400 to-green-600 border-2 border-emerald-200 text-slate-950 font-black text-sm cursor-pointer"
+                disabled={purchasePending}
+                className="arcade-btn py-2.5 rounded-xl bg-gradient-to-b from-emerald-400 to-green-600 border-2 border-emerald-200 text-slate-950 font-black text-sm cursor-pointer disabled:opacity-60"
               >
-                {lang === 'fa' ? 'تأیید تراکنش آزمایشی' : 'Verify Sandbox Purchase'}
+                {purchasePending
+                  ? t(lang, 'loadingWorld')
+                  : lang === 'fa'
+                  ? 'تأیید تراکنش آزمایشی'
+                  : 'Verify Sandbox Purchase'}
               </button>
             </div>
           </div>
@@ -241,7 +250,7 @@ export const ShopModal: React.FC<ShopModalProps> = ({
 interface MissionsModalProps {
   lang: Language;
   save: SaveData;
-  onClaimMission: (missionId: string, rewardCoins: number) => void;
+  onClaimMission: (missionId: string) => void;
   onBack: () => void;
 }
 
@@ -304,7 +313,7 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
 
               <button
                 disabled={!done || claimed}
-                onClick={() => onClaimMission(m.id, m.rewardCoins)}
+                onClick={() => onClaimMission(m.id)}
                 className={`arcade-btn px-4 py-2.5 rounded-xl border-2 font-black text-xs sm:text-sm flex items-center justify-center gap-1.5 min-w-[130px] cursor-pointer ${
                   claimed
                     ? 'bg-slate-800 border-emerald-400/35 text-emerald-300 cursor-default'
@@ -337,7 +346,7 @@ export const MissionsModal: React.FC<MissionsModalProps> = ({
 interface DailyRewardsModalProps {
   lang: Language;
   save: SaveData;
-  onClaimDaily: (coins: number, doubleViaAd: boolean) => void;
+  onClaimDaily: (doubleViaAd: boolean) => void;
   onBack: () => void;
 }
 
@@ -432,13 +441,13 @@ export const DailyRewardsModal: React.FC<DailyRewardsModalProps> = ({
               </div>
               <div className="flex flex-wrap items-center gap-2.5">
                 <button
-                  onClick={() => onClaimDaily(activeConfig.coins, false)}
+                  onClick={() => onClaimDaily(false)}
                   className="arcade-btn px-5 py-3 rounded-xl bg-gradient-to-b from-emerald-400 to-green-600 border-2 border-emerald-200 text-slate-950 font-black text-sm cursor-pointer"
                 >
                   {t(lang, 'claim')}
                 </button>
                 <button
-                  onClick={() => onClaimDaily(activeConfig.coins, true)}
+                  onClick={() => onClaimDaily(true)}
                   className="arcade-btn px-5 py-3 rounded-xl bg-gradient-to-b from-amber-400 to-orange-500 border-2 border-yellow-200 text-slate-950 font-black text-sm flex items-center gap-1.5 cursor-pointer"
                 >
                   <Video className="w-4 h-4" />
@@ -572,8 +581,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="cartoon-panel rounded-2xl p-4 space-y-4">
           <div className="space-y-2">
             <span className="font-extrabold text-sm">{t(lang, 'graphicsQuality')}</span>
-            <div className="grid grid-cols-3 gap-2">
-              {(['low', 'medium', 'high'] as const).map((q) => (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {(['low', 'medium', 'high', 'auto'] as const).map((q) => (
                 <button
                   key={q}
                   onClick={() => onUpdateSettings({ graphicsQuality: q })}
@@ -587,10 +596,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ? t(lang, 'qualityLow')
                     : q === 'medium'
                     ? t(lang, 'qualityMedium')
-                    : t(lang, 'qualityHigh')}
+                    : q === 'high'
+                    ? t(lang, 'qualityHigh')
+                    : t(lang, 'qualityAuto')}
                 </button>
               ))}
             </div>
+            {settings.graphicsQuality === 'auto' && (
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                {lang === 'fa'
+                  ? 'کیفیت خودکار از تنظیم محافظه‌کارانه شروع می‌کند و بر اساس زمان فریم، رزولوشن را کم یا زیاد می‌کند.'
+                  : 'Auto starts conservatively and scales render resolution up or down based on frame time.'}
+              </p>
+            )}
           </div>
 
           <div className="space-y-2">
@@ -628,6 +646,86 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </button>
             </div>
           </div>
+
+          <SliderRow
+            label={t(lang, 'steeringDeadZone')}
+            valueLabel={`${Math.round(settings.steeringDeadZone * 100)}%`}
+            min={0}
+            max={0.2}
+            step={0.01}
+            value={settings.steeringDeadZone}
+            accent="accent-sky-400"
+            onChange={(v) => onUpdateSettings({ steeringDeadZone: v })}
+          />
+          <SliderRow
+            label={t(lang, 'controlScale')}
+            valueLabel={`${Math.round(settings.controlScale * 100)}%`}
+            min={0.8}
+            max={1.25}
+            step={0.05}
+            value={settings.controlScale}
+            accent="accent-amber-400"
+            onChange={(v) => onUpdateSettings({ controlScale: v })}
+          />
+          <SliderRow
+            label={t(lang, 'controlOpacity')}
+            valueLabel={`${Math.round(settings.controlOpacity * 100)}%`}
+            min={0.4}
+            max={1}
+            step={0.05}
+            value={settings.controlOpacity}
+            accent="accent-emerald-400"
+            onChange={(v) => onUpdateSettings({ controlOpacity: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'leftHanded')}
+            checked={settings.leftHanded}
+            onChange={(v) => onUpdateSettings({ leftHanded: v })}
+          />
+        </div>
+
+        {/* Effects & Accessibility */}
+        <div className="cartoon-panel rounded-2xl p-4 space-y-3">
+          <span className="font-extrabold text-sm">{t(lang, 'graphicsEffects')}</span>
+          <SliderRow
+            label={t(lang, 'shakeIntensity')}
+            valueLabel={`${Math.round(settings.shakeIntensity * 100)}%`}
+            min={0}
+            max={1.5}
+            step={0.1}
+            value={settings.shakeIntensity}
+            accent="accent-rose-400"
+            onChange={(v) => onUpdateSettings({ shakeIntensity: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'reduceMotion')}
+            checked={settings.reduceMotion}
+            onChange={(v) =>
+              onUpdateSettings({
+                reduceMotion: v,
+              })
+            }
+          />
+          <ToggleRow
+            label={t(lang, 'chromaticAberration')}
+            checked={settings.chromaticAberration}
+            onChange={(v) => onUpdateSettings({ chromaticAberration: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'filmGrain')}
+            checked={settings.filmGrain}
+            onChange={(v) => onUpdateSettings({ filmGrain: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'speedLines')}
+            checked={settings.speedLines}
+            onChange={(v) => onUpdateSettings({ speedLines: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'bloomEnabled')}
+            checked={settings.bloomEnabled}
+            onChange={(v) => onUpdateSettings({ bloomEnabled: v })}
+          />
         </div>
 
         {/* Unity 6.3 & Cafe Bazaar Publishing Checklist */}
@@ -705,6 +803,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     </div>
   );
 };
+
+/* ==================== SMALL SETTINGS CONTROLS ==================== */
+const SliderRow: React.FC<{
+  label: string;
+  valueLabel: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  accent: string;
+  onChange: (value: number) => void;
+}> = ({ label, valueLabel, min, max, step, value, accent, onChange }) => (
+  <div className="space-y-1.5">
+    <div className="flex justify-between text-sm font-bold">
+      <span>{label}</span>
+      <span className="text-sky-300 tabular-nums">{valueLabel}</span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className={`w-full ${accent} cursor-pointer`}
+    />
+  </div>
+);
+
+const ToggleRow: React.FC<{
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}> = ({ label, checked, onChange }) => (
+  <button
+    onClick={() => onChange(!checked)}
+    className="w-full flex items-center justify-between gap-3 text-sm font-bold cursor-pointer"
+    role="switch"
+    aria-checked={checked}
+  >
+    <span>{label}</span>
+    <span
+      className={`w-11 h-6 rounded-full p-0.5 transition-colors ${
+        checked ? 'bg-emerald-400' : 'bg-slate-700'
+      }`}
+    >
+      <span
+        className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+          checked ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'
+        }`}
+      />
+    </span>
+  </button>
+);
 
 /* ==================== AD PLAYER SIMULATOR OVERLAY ==================== */
 interface AdOverlayProps {
