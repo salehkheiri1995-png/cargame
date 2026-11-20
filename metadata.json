@@ -1,0 +1,6 @@
+{
+  "name": "Turbo Road — جاده توربو",
+  "description": "Colorful 3D cartoon arcade racing game with Endless Mode, 30 Level missions, 12 customizable 3D vehicles, 5 vibrant worlds, daily rewards, and bilingual Persian/English UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
