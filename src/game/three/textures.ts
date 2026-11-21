@@ -855,6 +855,7 @@ export function createHumanFaceTexture(options: {
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.shared = true;
   tex.needsUpdate = true;
   faceTextureCache.set(key, tex);
   return tex;
@@ -948,9 +949,160 @@ export function createDashboardTexture(): THREE.CanvasTexture {
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.shared = true;
   tex.needsUpdate = true;
   cachedDashboardTexture = tex;
   return tex;
 }
+
+let cachedHoneycombGrilleTexture: THREE.CanvasTexture | null = null;
+
+/**
+ * Procedural metallic hexagonal honeycomb intake grille mesh for photorealistic front bumpers.
+ */
+export function createHoneycombGrilleTexture(): THREE.CanvasTexture {
+  if (cachedHoneycombGrilleTexture) return cachedHoneycombGrilleTexture;
+
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
+
+  // Deep recessed radiator cavity behind the grille
+  ctx.fillStyle = '#05070b';
+  ctx.fillRect(0, 0, size, size);
+
+  // Subtle horizontal intercooler core fins behind the mesh
+  ctx.fillStyle = '#111622';
+  for (let y = 6; y < size; y += 16) {
+    ctx.fillRect(0, y, size, 4);
+  }
+
+  // Hexagonal satin-metallic honeycomb ribs
+  const r = 16;
+  const dx = r * 1.5;
+  const dy = r * Math.sqrt(3);
+  ctx.lineJoin = 'round';
+
+  for (let col = -1; col <= Math.ceil(size / dx) + 1; col++) {
+    for (let row = -1; row <= Math.ceil(size / dy) + 1; row++) {
+      const cx = col * dx;
+      const cy = row * dy + (col % 2 !== 0 ? dy * 0.5 : 0);
+
+      // Dark metallic bevel shadow
+      ctx.beginPath();
+      for (let k = 0; k < 6; k++) {
+        const ang = (k * Math.PI) / 3;
+        const px = cx + Math.cos(ang) * (r - 2.2);
+        const py = cy + Math.sin(ang) * (r - 2.2);
+        if (k === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = '#333b4d';
+      ctx.lineWidth = 4.2;
+      ctx.stroke();
+
+      // Subtle top specular highlight along hex edge
+      ctx.strokeStyle = '#525f7a';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(3.2, 1.3);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.shared = true;
+  tex.needsUpdate = true;
+  cachedHoneycombGrilleTexture = tex;
+  return tex;
+}
+
+let cachedLicensePlateTexture: THREE.CanvasTexture | null = null;
+
+/**
+ * Crisp realistic modern sport license plate texture with blue side band and metallic border.
+ */
+export function createLicensePlateTexture(): THREE.CanvasTexture {
+  if (cachedLicensePlateTexture) return cachedLicensePlateTexture;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d')!;
+
+  // Embossed matte-white aluminum plate base
+  const bg = ctx.createLinearGradient(0, 0, 0, 128);
+  bg.addColorStop(0, '#f8fafc');
+  bg.addColorStop(0.5, '#e8edf4');
+  bg.addColorStop(1, '#d8e0eb');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, 512, 128);
+
+  // Dark outer frame bezel
+  ctx.strokeStyle = '#0f172a';
+  ctx.lineWidth = 10;
+  ctx.strokeRect(5, 5, 502, 118);
+
+  // Left blue country/sport series band
+  ctx.fillStyle = '#1d4ed8';
+  ctx.fillRect(10, 10, 62, 108);
+
+  // Mini emblem stripes & series label inside blue band
+  ctx.fillStyle = '#22c55e';
+  ctx.fillRect(20, 22, 42, 7);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(20, 29, 42, 7);
+  ctx.fillStyle = '#ef4444';
+  ctx.fillRect(20, 36, 42, 7);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('TRB', 41, 86);
+
+  // Right regional badge separator
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(416, 12);
+  ctx.lineTo(416, 116);
+  ctx.stroke();
+
+  // Main embossed plate characters
+  ctx.fillStyle = '#0f172a';
+  ctx.font = 'bold 58px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('74 · GT 99', 244, 68);
+
+  // Region code on right
+  ctx.font = 'bold 42px sans-serif';
+  ctx.fillText('01', 460, 74);
+  ctx.fillStyle = '#475569';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.fillText('PRO', 460, 32);
+
+  // Subtle mounting bolts
+  ctx.fillStyle = '#94a3b8';
+  [92, 400].forEach((bx) => {
+    ctx.beginPath();
+    ctx.arc(bx, 64, 5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.shared = true;
+  tex.needsUpdate = true;
+  cachedLicensePlateTexture = tex;
+  return tex;
+}
+
 
 

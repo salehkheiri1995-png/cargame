@@ -699,7 +699,9 @@ export class TurboRoadEngine {
       for (const value of Object.values(mat as unknown as Record<string, unknown>)) {
         if (value && (value as THREE.Texture).isTexture) {
           const texture = value as THREE.Texture;
-          if (!protectedTextures.has(texture)) texture.dispose();
+          if (!protectedTextures.has(texture) && !texture.userData?.shared) {
+            texture.dispose();
+          }
         }
       }
       mat.dispose();
@@ -752,6 +754,7 @@ export class TurboRoadEngine {
     }
 
     if (this.playerCar) {
+      this.playerCar.driverAnimator.dispose();
       this.scene.remove(this.playerCar.root);
       this.disposeObjectTree(this.playerCar.root);
       this.playerCar = null;
@@ -1535,17 +1538,11 @@ export class TurboRoadEngine {
       pivot.rotation.y = THREE.MathUtils.damp(pivot.rotation.y, frontSteerAngle, 14, dt);
     }
 
-    // Live Interior Kinematics: Steering wheel spins & driver turns head into corners!
+    // Live Interior Kinematics: Steering wheel spins & skeletal driver arms/hands + head lean into curves!
     this.playerCar.steeringWheel.rotation.z = THREE.MathUtils.damp(
       this.playerCar.steeringWheel.rotation.z,
       -steerDir * 1.15,
       14,
-      dt
-    );
-    this.playerCar.driverHead.rotation.y = THREE.MathUtils.damp(
-      this.playerCar.driverHead.rotation.y,
-      -steerDir * 0.28,
-      10,
       dt
     );
     // Keep doors tightly latched during racing
@@ -1556,6 +1553,24 @@ export class TurboRoadEngine {
     if (this.playerCar.cabinLight) {
       this.playerCar.cabinLight.intensity = this.cameraMode === 'cockpit' ? 0.65 : 0;
     }
+    this.playerCar.root.updateMatrixWorld(true);
+    const speedNormLive = THREE.MathUtils.clamp(
+      (this.playerSpeed - 12) / Math.max(1, this.nitroMaxSpeed - 12),
+      0,
+      1
+    );
+    this.playerCar.driverAnimator.update({
+      dt,
+      steerInput: steerDir,
+      steeringWheelAngle: this.playerCar.steeringWheel.rotation.z,
+      speedNorm: speedNormLive,
+      braking: this.input.brake,
+      nitroActive: isSuperBoosted,
+      lateralG: this.playerLateralVel,
+      roadCurvature: this.curveStrength,
+      isCockpitCamera: this.cameraMode === 'cockpit',
+      elapsed: this.elapsedTotal,
+    });
 
     // OLED Brake light flare + tire smoke
     for (const bl of this.playerCar.brakeLights) {
@@ -2093,16 +2108,27 @@ export class TurboRoadEngine {
 
     if (this.cameraMode === 'cockpit') {
       const co = this.playerCar.cockpitCameraOffset;
-      _camTargetPos.set(this.playerX + co.x, co.y + 0.04, co.z + 0.28);
+      const headPose = this.playerCar.driverAnimator.getHeadPose();
+      _camTargetPos.set(
+        this.playerX + co.x - headPose.roll * 0.14,
+        co.y + 0.04,
+        co.z + 0.28
+      );
       this.camera.position.x = THREE.MathUtils.damp(this.camera.position.x, _camTargetPos.x, 22, dt);
       this.camera.position.y = THREE.MathUtils.damp(this.camera.position.y, _camTargetPos.y, 22, dt);
       this.camera.position.z = THREE.MathUtils.damp(this.camera.position.z, _camTargetPos.z, 22, dt);
       this.updateShakeCamera(dt);
       const lookCurveX = getCurveOffsetX(-34, this.curveStrength) * 0.75;
       const lookHillY = getHillOffsetY(-34, this.hillStrength) * 0.55;
-      _camLookAt.set(this.playerX + co.x + lookCurveX, co.y - 0.14 + lookHillY, -34);
+      this.camera.up.set(Math.sin(headPose.roll * 0.28), Math.cos(headPose.roll * 0.28), 0);
+      _camLookAt.set(
+        this.playerX + co.x + lookCurveX - headPose.yaw * 5.2,
+        co.y - 0.14 + lookHillY + headPose.pitch * 3.5,
+        -34
+      );
       this.camera.lookAt(_camLookAt);
     } else if (this.cameraMode === 'hood') {
+      this.camera.up.set(0, 1, 0);
       _camTargetPos.set(this.playerX, 1.48, -0.55);
       this.camera.position.x = THREE.MathUtils.damp(this.camera.position.x, _camTargetPos.x, 18, dt);
       this.camera.position.y = THREE.MathUtils.damp(this.camera.position.y, _camTargetPos.y, 18, dt);
@@ -2113,6 +2139,7 @@ export class TurboRoadEngine {
       _camLookAt.set(this.playerX + lookCurveX, 1.25 + lookHillY, -32);
       this.camera.lookAt(_camLookAt);
     } else if (this.cameraMode === 'low') {
+      this.camera.up.set(0, 1, 0);
       _camTargetPos.set(
         this.playerX * 0.78 - this.curveStrength * 0.35,
         2.55,
@@ -2127,6 +2154,7 @@ export class TurboRoadEngine {
       _camLookAt.set(this.playerX * 0.9 + lookCurveX, 1.15 + lookHillY, -22);
       this.camera.lookAt(_camLookAt);
     } else {
+      this.camera.up.set(0, 1, 0);
       _camTargetPos.set(
         this.playerX * 0.68 - this.curveStrength * 0.45,
         4.15,
@@ -2367,9 +2395,23 @@ export class TurboRoadEngine {
       if (this.playerCar.cabinLight) {
         this.playerCar.cabinLight.intensity = 0.65 + p * 2.4;
       }
-      // Gentle showroom life: steering wheel & driver head subtly glance around
-      this.playerCar.steeringWheel.rotation.z = Math.sin(this.elapsedTotal * 0.9) * 0.25;
-      this.playerCar.driverHead.rotation.y = Math.sin(this.elapsedTotal * 0.75) * 0.22;
+      this.camera.up.set(0, 1, 0);
+      // Gentle showroom life: steering wheel turns & skeletal driver arms/hands & head follow naturally
+      const demoSteer = Math.sin(this.elapsedTotal * 0.85) * 0.36;
+      this.playerCar.steeringWheel.rotation.z = -demoSteer * 0.85;
+      this.playerCar.root.updateMatrixWorld(true);
+      this.playerCar.driverAnimator.update({
+        dt,
+        steerInput: demoSteer,
+        steeringWheelAngle: this.playerCar.steeringWheel.rotation.z,
+        speedNorm: 0.08,
+        braking: false,
+        nitroActive: false,
+        lateralG: demoSteer * 2.2,
+        roadCurvature: 0,
+        isCockpitCamera: false,
+        elapsed: this.elapsedTotal,
+      });
 
       // Optical vertical framing: lift the car cleanly into the open showroom stage above the dealership dock
       const w = Math.max(1, this.container.clientWidth || window.innerWidth);
@@ -2459,7 +2501,23 @@ export class TurboRoadEngine {
       this.camera.position.lerp(_camTargetPos, 1 - Math.exp(-4 * dt));
       _camLookAt.set(0, 0.96, -0.5);
       this.camera.lookAt(_camLookAt);
+      this.camera.up.set(0, 1, 0);
+      const cruiseSteer = Math.sin(this.elapsedTotal * 0.55) * 0.14;
+      this.playerCar.steeringWheel.rotation.z = -cruiseSteer * 0.7;
       this.playerCar.root.rotation.y = 0;
+      this.playerCar.root.updateMatrixWorld(true);
+      this.playerCar.driverAnimator.update({
+        dt,
+        steerInput: cruiseSteer,
+        steeringWheelAngle: this.playerCar.steeringWheel.rotation.z,
+        speedNorm: 0.35,
+        braking: false,
+        nitroActive: false,
+        lateralG: cruiseSteer * 1.4,
+        roadCurvature: 0,
+        isCockpitCamera: false,
+        elapsed: this.elapsedTotal,
+      });
     }
 
     for (const cloud of this.worldRig.clouds) {
@@ -2767,6 +2825,7 @@ export class TurboRoadEngine {
     this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
 
     if (this.playerCar) {
+      this.playerCar.driverAnimator.dispose();
       this.scene.remove(this.playerCar.root);
       this.disposeObjectTree(this.playerCar.root);
       this.playerCar = null;

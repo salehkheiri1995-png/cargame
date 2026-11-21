@@ -51,7 +51,6 @@ import {
 import { TurboRoadEngine } from './game/three/gameEngine';
 import type {
   ActiveRaceConfig,
-  DebugStats,
   EnvironmentId,
   GameSettings,
   LevelConfig,
@@ -63,10 +62,6 @@ import type {
   VehicleConfig,
   VehicleUpgradeLevels,
 } from './game/types';
-
-const IS_DEV = Boolean(
-  (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
-);
 
 const INITIAL_HUD: RaceHudSnapshot = {
   speedKmh: 0,
@@ -140,7 +135,6 @@ export default function App() {
   const [pendingAd, setPendingAd] = useState<PendingAd | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [storageError, setStorageError] = useState<string | null>(null);
-  const [debugStats, setDebugStats] = useState<DebugStats | null>(null);
 
   const lang = save.settings.language;
 
@@ -257,7 +251,6 @@ export default function App() {
     const engine = new TurboRoadEngine(container, {
       onHudUpdate: (snapshot) => setHud(snapshot),
       onRaceEnd: (res) => handleRaceEndRef.current(res),
-      onDebugStats: IS_DEV ? (stats) => setDebugStats(stats) : undefined,
     });
 
     const initialSave = saveRef.current;
@@ -793,30 +786,6 @@ export default function App() {
           onResetSave={handleResetSave}
           onBack={() => handleNavigate('menu')}
         />
-      )}
-
-      {/* Dev-only performance overlay (tree-shaken from production callbacks) */}
-      {IS_DEV && debugStats && (
-        <div className="fixed bottom-1 left-1 z-[70] px-2 py-1.5 rounded-lg bg-slate-950/85 border border-white/15 text-[10px] leading-tight font-mono text-slate-300 pointer-events-none">
-          <div className="text-emerald-300 font-bold">{t(lang, 'debugStatsTitle')}</div>
-          <div>
-            {t(lang, 'fpsLabel')}: {debugStats.fps} · {t(lang, 'frameTimeLabel')}:{' '}
-            {debugStats.frameTimeMs}ms
-          </div>
-          <div>
-            {t(lang, 'drawCallsLabel')}: {debugStats.drawCalls} · {t(lang, 'trianglesLabel')}:{' '}
-            {debugStats.triangles}
-          </div>
-          <div>
-            {t(lang, 'geometriesLabel')}: {debugStats.geometries} · {t(lang, 'texturesLabel')}:{' '}
-            {debugStats.textures}
-          </div>
-          <div>
-            {t(lang, 'pixelRatioLabel')}: {debugStats.pixelRatio} ·{' '}
-            {t(lang, 'effectiveQualityLabel')}: {debugStats.effectiveQuality} ·{' '}
-            {t(lang, 'autoScaleLabel')}: {debugStats.autoRenderScale}
-          </div>
-        </div>
       )}
 
       {/* Ad Player Modal (Rewarded Video / Interstitial — never triggers during active driving) */}
