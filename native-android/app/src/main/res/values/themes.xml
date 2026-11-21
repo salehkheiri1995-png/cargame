@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TurboRoad" parent="android:Theme.Black.NoTitleBar.Fullscreen">
+        <item name="android:windowBackground">#070b14</item>
+        <item name="android:statusBarColor">#05070d</item>
+        <item name="android:navigationBarColor">#05070d</item>
+    </style>
+
+    <style name="Theme.TurboRoad.Fullscreen" parent="Theme.TurboRoad">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

@@ -253,6 +253,27 @@ Node. Use the checklist below manually.
 5. Only enable real monetization after wiring a store SDK + ad SDK + server
    receipt validator and updating `TurboRoadNativePlugin.java`.
 
+## Native Android rewrite (in progress)
+
+Separate from the Capacitor wrapper, `native-android/` is a **pure Kotlin +
+OpenGL ES 3.0** project (no WebView). It builds a native APK:
+
+```powershell
+$env:JAVA_HOME = "C:\Android\jdk21\jdk-21.0.13+9"
+cd native-android
+.\gradlew.bat assembleDebug
+# APK: native-android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+What the foundation already has: a 3-lane road with markings, a player car with
+lane-switch touch controls, oncoming traffic with collision, speed/distance/score
+HUD, and a game-over/restart state. Everything runs at ~60 FPS.
+
+What is **not** yet ported (requires a full multi-phase rewrite): 56 cars, 45
+levels, garage/paint/upgrades, economy/missions/daily rewards, the post-processing
+cinematic pipeline, and the bilingual RTL UI. These are the remaining milestones of
+the native route.
+
 ## Real integration needs (not yet implemented)
 
 These require real developer accounts/SDKs and are intentionally stubbed:

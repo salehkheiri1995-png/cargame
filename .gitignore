@@ -21,3 +21,7 @@ android/.cxx/
 keystore.properties
 android/keystore.properties
 android/app/release/
+native-android/.gradle/
+native-android/local.properties
+native-android/build/
+native-android/app/build/
