@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { DriverSkeletonRig } from './driverAnimator';
 import { createHumanFaceTexture } from './textures';
 
 export type HumanArchetype = 'man' | 'woman' | 'child' | 'marshal';
@@ -17,12 +18,7 @@ export interface SpectatorRig {
   facingY: number;
 }
 
-export interface SeatedDriverRig {
-  root: THREE.Group;
-  headPivot: THREE.Object3D;
-  leftArmPivot: THREE.Object3D;
-  rightArmPivot: THREE.Object3D;
-}
+export type SeatedDriverRig = DriverSkeletonRig;
 
 const SKIN_TONES = ['#f3cfb4', '#e5b895', '#d49e72', '#b97e53', '#f6d5be'];
 const HAIR_COLORS = ['#18181b', '#3f2310', '#5c3317', '#854d0e', '#1f2937', '#713f12'];
@@ -472,21 +468,138 @@ export function buildRealisticSpectator(
   };
 }
 
+/**
+ * Generates a continuous, smoothly weighted skeletal arm geometry (deltoid -> bicep -> elbow -> forearm -> wrist)
+ * spanning from local y = 0 down to y = -(upperLen + foreLen), offset to the shoulder's bind-pose position.
+ */
+function createSkinnedArmGeometry(
+  upperLen: number,
+  foreLen: number,
+  bindOffset: THREE.Vector3,
+  upperBoneIdx: number,
+  foreBoneIdx: number,
+  handBoneIdx: number
+): THREE.BufferGeometry {
+  const totalLen = upperLen + foreLen;
+  const radialSegs = 12;
+  const heightSegs = 18;
+  const geo = new THREE.CylinderGeometry(1, 1, totalLen, radialSegs, heightSegs, false);
+
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute;
+  const skinIndices: number[] = [];
+  const skinWeights: number[] = [];
+
+  for (let i = 0; i < pos.count; i++) {
+    const vx = pos.getX(i);
+    const vy = pos.getY(i); // [-totalLen/2, +totalLen/2]
+    const vz = pos.getZ(i);
+
+    // Distance along arm from shoulder (0) to wrist (totalLen)
+    const tDist = totalLen * 0.5 - vy;
+    const tNorm = THREE.MathUtils.clamp(tDist / totalLen, 0, 1);
+
+    // Sculpted anatomical sleeve profile: rounded shoulder cap -> bicep -> elbow taper -> forearm -> wrist cuff
+    let radius: number;
+    if (tNorm < 0.08) {
+      radius = THREE.MathUtils.lerp(0.056, 0.064, tNorm / 0.08);
+    } else if (tNorm < 0.48) {
+      radius = THREE.MathUtils.lerp(0.064, 0.049, (tNorm - 0.08) / 0.4);
+    } else if (tNorm < 0.56) {
+      radius = 0.047; // elbow joint
+    } else {
+      radius = THREE.MathUtils.lerp(0.047, 0.034, (tNorm - 0.56) / 0.44);
+    }
+
+    const finalX = vx * radius + bindOffset.x;
+    const finalY = -tDist + bindOffset.y;
+    const finalZ = vz * radius + bindOffset.z;
+    pos.setXYZ(i, finalX, finalY, finalZ);
+
+    // Smooth linear-blend skinning weights across shoulder -> elbow -> wrist joints
+    const elbowHalfBand = 0.055;
+    const wristStart = totalLen - 0.035;
+
+    if (tDist <= upperLen - elbowHalfBand) {
+      skinIndices.push(upperBoneIdx, foreBoneIdx, 0, 0);
+      skinWeights.push(1, 0, 0, 0);
+    } else if (tDist < upperLen + elbowHalfBand) {
+      const f = (tDist - (upperLen - elbowHalfBand)) / (elbowHalfBand * 2);
+      const smoothF = f * f * (3 - 2 * f);
+      skinIndices.push(upperBoneIdx, foreBoneIdx, 0, 0);
+      skinWeights.push(1 - smoothF, smoothF, 0, 0);
+    } else if (tDist < wristStart) {
+      skinIndices.push(foreBoneIdx, handBoneIdx, 0, 0);
+      skinWeights.push(1, 0, 0, 0);
+    } else {
+      const w = THREE.MathUtils.clamp((tDist - wristStart) / Math.max(0.001, totalLen - wristStart), 0, 1);
+      skinIndices.push(foreBoneIdx, handBoneIdx, 0, 0);
+      skinWeights.push(1 - w * 0.65, w * 0.65, 0, 0);
+    }
+  }
+
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
+ * Builds a detailed gloved racing hand (wrist cuff, palm, curled gripping fingers, and thumb)
+ * attached directly to the driver's leftHand / rightHand skeletal bone.
+ */
+function buildGlovedRacingHand(
+  side: -1 | 1,
+  gloveMat: THREE.Material,
+  trimMat: THREE.Material
+): THREE.Group {
+  const handGroup = new THREE.Group();
+
+  // Wrist racing gauntlet cuff
+  const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.038, 0.045, 10), trimMat);
+  cuff.position.set(0, -0.01, 0);
+  handGroup.add(cuff);
+
+  // Sculpted palm extending along -Y
+  const palm = new THREE.Mesh(new THREE.BoxGeometry(0.068, 0.072, 0.036), gloveMat);
+  palm.position.set(0, -0.056, 0);
+  handGroup.add(palm);
+
+  // Curled fingers wrapping cleanly around the steering wheel rim
+  const fingers = new THREE.Mesh(new THREE.CapsuleGeometry(0.022, 0.052, 5, 8), gloveMat);
+  fingers.rotation.z = Math.PI / 2;
+  fingers.position.set(0, -0.092, 0.018);
+  handGroup.add(fingers);
+
+  // Opposable thumb resting cleanly on the inner rim spoke
+  const thumb = new THREE.Mesh(new THREE.CapsuleGeometry(0.015, 0.036, 4, 8), gloveMat);
+  thumb.position.set(-side * 0.038, -0.06, 0.012);
+  thumb.rotation.z = side * 0.65;
+  thumb.rotation.x = 0.35;
+  handGroup.add(thumb);
+
+  return handGroup;
+}
+
+/**
+ * Builds a full Three.js Skeletal Rig (THREE.Bone hierarchy + THREE.Skeleton + THREE.SkinnedMesh arms +
+ * procedural AnimationClip played via THREE.AnimationMixer) for the seated race driver.
+ */
 export function buildSeatedDriver(options: {
   useHelmet: boolean;
   suitColorHex: string;
   accentHex: string;
   scale?: number;
-}): SeatedDriverRig {
+}): DriverSkeletonRig {
   const geos = getSharedHumanGeos();
   const root = new THREE.Group();
-  const s = options.scale ?? 0.92;
+  root.name = 'SeatedDriverRoot';
+  const s = options.scale ?? 0.88;
   root.scale.setScalar(s);
 
   const suitMat = new THREE.MeshStandardMaterial({
     color: options.useHelmet ? 0x111827 : 0x1e293b,
-    roughness: 0.65,
-    metalness: 0.1,
+    roughness: 0.62,
+    metalness: 0.12,
   });
   const trimMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(options.accentHex),
@@ -495,37 +608,127 @@ export function buildSeatedDriver(options: {
   });
   const gloveMat = new THREE.MeshStandardMaterial({
     color: 0x0f172a,
-    roughness: 0.55,
+    roughness: 0.5,
+    metalness: 0.14,
   });
   const skinMat = new THREE.MeshStandardMaterial({ color: '#e6b892', roughness: 0.52 });
 
+  // 1. Construct the True Skeletal Bone Hierarchy
+  const upperArmLength = 0.32;
+  const forearmLength = 0.3;
+
+  const hipsBone = new THREE.Bone();
+  hipsBone.name = 'Hips';
+  hipsBone.position.set(0, 0.04, 0.03);
+
+  const spineBone = new THREE.Bone();
+  spineBone.name = 'Spine';
+  spineBone.position.set(0, 0.14, 0);
+  hipsBone.add(spineBone);
+
+  const chestBone = new THREE.Bone();
+  chestBone.name = 'Chest';
+  chestBone.position.set(0, 0.28, 0);
+  spineBone.add(chestBone);
+
+  const neckBone = new THREE.Bone();
+  neckBone.name = 'Neck';
+  neckBone.position.set(0, 0.11, 0.01);
+  chestBone.add(neckBone);
+
+  const headBone = new THREE.Bone();
+  headBone.name = 'Head';
+  headBone.position.set(0, 0.06, 0);
+  neckBone.add(headBone);
+
+  // Left Arm Skeletal Chain: Shoulder -> Elbow -> Wrist/Hand
+  const leftUpperArm = new THREE.Bone();
+  leftUpperArm.name = 'LeftUpperArm';
+  leftUpperArm.position.set(-0.21, -0.01, 0.01);
+  chestBone.add(leftUpperArm);
+
+  const leftForearm = new THREE.Bone();
+  leftForearm.name = 'LeftForearm';
+  leftForearm.position.set(0, -upperArmLength, 0);
+  leftUpperArm.add(leftForearm);
+
+  const leftHand = new THREE.Bone();
+  leftHand.name = 'LeftHand';
+  leftHand.position.set(0, -forearmLength, 0);
+  leftForearm.add(leftHand);
+
+  // Right Arm Skeletal Chain: Shoulder -> Elbow -> Wrist/Hand
+  const rightUpperArm = new THREE.Bone();
+  rightUpperArm.name = 'RightUpperArm';
+  rightUpperArm.position.set(0.21, -0.01, 0.01);
+  chestBone.add(rightUpperArm);
+
+  const rightForearm = new THREE.Bone();
+  rightForearm.name = 'RightForearm';
+  rightForearm.position.set(0, -upperArmLength, 0);
+  rightUpperArm.add(rightForearm);
+
+  const rightHand = new THREE.Bone();
+  rightHand.name = 'RightHand';
+  rightHand.position.set(0, -forearmLength, 0);
+  rightForearm.add(rightHand);
+
+  root.add(hipsBone);
+
+  const bonesList: THREE.Bone[] = [
+    hipsBone,       // 0
+    spineBone,      // 1
+    chestBone,      // 2
+    neckBone,       // 3
+    headBone,       // 4
+    leftUpperArm,   // 5
+    leftForearm,    // 6
+    leftHand,       // 7
+    rightUpperArm,  // 8
+    rightForearm,   // 9
+    rightHand,      // 10
+  ];
+
+  // Update bind-pose transforms before creating THREE.Skeleton & binding SkinnedMeshes
+  root.updateMatrixWorld(true);
+  const skeleton = new THREE.Skeleton(bonesList);
+
+  // 2. Seated Thighs attached to Hips Bone
   [-0.1, 0.1].forEach((tx) => {
     const thigh = new THREE.Mesh(geos.thighGeo, suitMat);
     thigh.rotation.x = Math.PI / 2 - 0.12;
-    thigh.position.set(tx, 0.06, -0.02);
-    root.add(thigh);
+    thigh.position.set(tx, 0.02, -0.05);
+    hipsBone.add(thigh);
   });
 
+  // 3. Torso, Racing Harness Straps & Shoulder Pads attached to Spine/Chest Bones
   const torso = new THREE.Mesh(geos.manTorso, suitMat);
   torso.scale.set(1.04, 0.92, 0.66);
-  torso.rotation.x = 0.14;
-  torso.position.set(0, 0.02, 0.04);
-  root.add(torso);
+  torso.rotation.x = 0.12;
+  torso.position.set(0, -0.15, 0.01);
+  spineBone.add(torso);
 
   [-0.085, 0.085].forEach((sx) => {
-    const strap = new THREE.Mesh(new THREE.BoxGeometry(0.042, 0.42, 0.03), trimMat);
-    strap.position.set(sx, 0.28, -0.085);
-    strap.rotation.x = 0.14;
-    root.add(strap);
+    const strap = new THREE.Mesh(new THREE.BoxGeometry(0.044, 0.4, 0.03), trimMat);
+    strap.position.set(sx, -0.14, -0.105);
+    strap.rotation.x = 0.12;
+    chestBone.add(strap);
+
+    // Sculpted deltoid shoulder bolster covering upper sleeve seam
+    const pad = new THREE.Mesh(new THREE.SphereGeometry(0.068, 10, 8), suitMat);
+    pad.position.set(sx < 0 ? -0.205 : 0.205, -0.01, 0.01);
+    chestBone.add(pad);
   });
 
+  // Neck Mesh attached to Neck Bone
   const neck = new THREE.Mesh(geos.neckGeo, options.useHelmet ? gloveMat : skinMat);
-  neck.position.set(0, 0.54, 0.06);
-  root.add(neck);
+  neck.position.set(0, 0.02, 0);
+  neckBone.add(neck);
 
-  const headPivot = new THREE.Group();
-  headPivot.position.set(0, 0.6, 0.05);
-  root.add(headPivot);
+  // 4. Head / Racing Helmet inside headVisual (attached to Head Bone so Cockpit Cam can toggle visibility cleanly)
+  const headVisual = new THREE.Group();
+  headVisual.name = 'DriverHeadVisual';
+  headBone.add(headVisual);
 
   if (options.useHelmet) {
     const helmetMat = new THREE.MeshPhysicalMaterial({
@@ -537,16 +740,16 @@ export function buildSeatedDriver(options: {
     });
     const shell = new THREE.Mesh(geos.helmetShellGeo, helmetMat);
     shell.scale.set(0.95, 1.02, 1.12);
-    shell.position.set(0, 0.09, 0);
-    headPivot.add(shell);
+    shell.position.set(0, 0.08, 0);
+    headVisual.add(shell);
 
     const hStripe = new THREE.Mesh(
       new THREE.TorusGeometry(0.156, 0.018, 6, 16, Math.PI),
       trimMat
     );
     hStripe.rotation.y = Math.PI / 2;
-    hStripe.position.set(0, 0.09, 0);
-    headPivot.add(hStripe);
+    hStripe.position.set(0, 0.08, 0);
+    headVisual.add(hStripe);
 
     const visorMat = new THREE.MeshPhysicalMaterial({
       color: 0x0ea5e9,
@@ -558,8 +761,8 @@ export function buildSeatedDriver(options: {
       new THREE.CylinderGeometry(0.148, 0.148, 0.082, 16, 1, true, Math.PI * 0.66, Math.PI * 0.68),
       visorMat
     );
-    visor.position.set(0, 0.1, -0.02);
-    headPivot.add(visor);
+    visor.position.set(0, 0.09, -0.02);
+    headVisual.add(visor);
   } else {
     const driverFaceMat = new THREE.MeshStandardMaterial({
       map: createHumanFaceTexture({
@@ -573,48 +776,84 @@ export function buildSeatedDriver(options: {
     });
     const head = new THREE.Mesh(geos.headGeo, driverFaceMat);
     head.rotation.y = Math.PI / 2;
-    head.position.set(0, 0.095, 0);
-    headPivot.add(head);
+    head.position.set(0, 0.085, 0);
+    headVisual.add(head);
 
     const hair = new THREE.Mesh(
       new THREE.SphereGeometry(0.126, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.56),
       new THREE.MeshStandardMaterial({ color: 0x18181b, roughness: 0.72 })
     );
     hair.scale.set(1.0, 1.1, 1.06);
-    hair.position.set(0, 0.115, 0.01);
-    headPivot.add(hair);
+    hair.position.set(0, 0.105, 0.01);
+    headVisual.add(hair);
   }
 
-  const buildDriverArm = (side: -1 | 1) => {
-    const pivot = new THREE.Group();
-    pivot.position.set(side * 0.21, 0.45, 0.04);
+  // 5. True THREE.SkinnedMesh Left & Right Racing Arms bound to the Skeleton!
+  const leftBindPos = new THREE.Vector3(-0.21, 0.45, 0.04);
+  const rightBindPos = new THREE.Vector3(0.21, 0.45, 0.04);
 
-    const upper = new THREE.Mesh(geos.upperLimbGeo, suitMat);
-    upper.rotation.x = -0.95;
-    upper.rotation.z = side * -0.14;
-    pivot.add(upper);
+  const leftArmGeo = createSkinnedArmGeometry(upperArmLength, forearmLength, leftBindPos, 5, 6, 7);
+  const leftArmSkinned = new THREE.SkinnedMesh(leftArmGeo, suitMat);
+  leftArmSkinned.name = 'DriverLeftArmSkinned';
+  leftArmSkinned.frustumCulled = false;
+  root.add(leftArmSkinned);
+  leftArmSkinned.bind(skeleton);
 
-    const fore = new THREE.Mesh(geos.lowerLimbGeo, suitMat);
-    fore.position.set(-side * 0.02, -0.15, -0.22);
-    fore.rotation.x = -1.35;
-    fore.rotation.z = side * 0.24;
-    pivot.add(fore);
+  const rightArmGeo = createSkinnedArmGeometry(upperArmLength, forearmLength, rightBindPos, 8, 9, 10);
+  const rightArmSkinned = new THREE.SkinnedMesh(rightArmGeo, suitMat);
+  rightArmSkinned.name = 'DriverRightArmSkinned';
+  rightArmSkinned.frustumCulled = false;
+  root.add(rightArmSkinned);
+  rightArmSkinned.bind(skeleton);
 
-    const hand = new THREE.Mesh(geos.handGeo, gloveMat);
-    hand.position.set(-side * 0.055, -0.2, -0.45);
-    pivot.add(hand);
+  // 6. Articulated Gloved Racing Hands attached directly to LeftHand & RightHand skeletal bones
+  leftHand.add(buildGlovedRacingHand(-1, gloveMat, trimMat));
+  rightHand.add(buildGlovedRacingHand(1, gloveMat, trimMat));
 
-    root.add(pivot);
-    return pivot;
-  };
+  // 7. Procedural Skeletal AnimationClip (subtle chest breathing & seated poise via AnimationMixer)
+  const breathTimes = [0, 1.3, 2.6];
+  const spineBreathTrack = new THREE.NumberKeyframeTrack(
+    'Spine.rotation[x]',
+    breathTimes,
+    [0.01, -0.025, 0.01]
+  );
+  const chestBreathTrack = new THREE.NumberKeyframeTrack(
+    'Chest.rotation[x]',
+    breathTimes,
+    [0.0, 0.024, 0.0]
+  );
+  const idleClip = new THREE.AnimationClip('DriverIdleBreath', 2.6, [
+    spineBreathTrack,
+    chestBreathTrack,
+  ]);
 
-  const leftArmPivot = buildDriverArm(-1);
-  const rightArmPivot = buildDriverArm(1);
+  const mixer = new THREE.AnimationMixer(root);
 
   return {
     root,
-    headPivot,
-    leftArmPivot,
-    rightArmPivot,
+    skeleton,
+    skinnedMeshes: [leftArmSkinned, rightArmSkinned],
+    bones: {
+      hips: hipsBone,
+      spine: spineBone,
+      chest: chestBone,
+      neck: neckBone,
+      head: headBone,
+      leftUpperArm,
+      leftForearm,
+      leftHand,
+      rightUpperArm,
+      rightForearm,
+      rightHand,
+    },
+    headVisual,
+    headPivot: headBone,
+    leftArmPivot: leftUpperArm,
+    rightArmPivot: rightUpperArm,
+    mixer,
+    clips: [idleClip],
+    upperArmLength,
+    forearmLength,
+    isExternalModel: false,
   };
 }

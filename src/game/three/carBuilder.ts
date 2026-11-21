@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { CarArchetype, CarRimColor, CarRimStyle, CarSpoilerStyle, CarVisualStyle } from '../types';
+import { DriverSkeletalController, type DriverSkeletonRig } from './driverAnimator';
 import { buildSeatedDriver } from './humanBuilder';
 import { createDashboardTexture } from './textures';
 
@@ -14,7 +15,13 @@ export interface BuiltCarRig {
   paintMaterials: THREE.MeshPhysicalMaterial[];
   shieldMesh: THREE.Mesh;
   steeringWheel: THREE.Object3D;
+  leftGripTarget: THREE.Object3D;
+  rightGripTarget: THREE.Object3D;
   driverHead: THREE.Object3D;
+  driverAnchor: THREE.Group;
+  driverScale: number;
+  driverRig: DriverSkeletonRig;
+  driverAnimator: DriverSkeletalController;
   leftDoorPivot: THREE.Object3D | null;
   rightDoorPivot: THREE.Object3D | null;
   doorStyle: 'swing' | 'scissor' | 'none';
@@ -981,22 +988,33 @@ export function buildCartoonCar(
     interiorGroup.add(infotainment);
   }
 
-  // Steering Column + Animated 3D Motorsport Steering Wheel (rotates live with player input!)
-  const wheelColumn = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.04, 0.28, 10), carbonMat);
-  wheelColumn.rotation.x = Math.PI / 2 - 0.28;
-  wheelColumn.position.set(driverX, beltY + 0.23, dashZ + 0.21);
+  // Ergonomic driver scale computed first so wheel placement & skeletal arm reach match every chassis
+  const cabinHeadroom = Math.max(0.42, roofMaxY - (beltY - spec.rideHeight));
+  const driverScale = THREE.MathUtils.clamp(cabinHeadroom / 0.84, 0.72, 0.92);
+
+  // Steering Column + Animated 3D Motorsport Steering Wheel with 9-o'clock / 3-o'clock IK Grip Targets!
+  const wheelZ = seatZ - 0.37 * driverScale;
+  const wheelY = beltY + 0.3 * driverScale;
+  const columnLen = Math.max(0.22, wheelZ - dashZ);
+  const wheelColumn = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.03, 0.038, columnLen, 10),
+    carbonMat
+  );
+  wheelColumn.rotation.x = Math.PI / 2 - 0.26;
+  wheelColumn.position.set(driverX, wheelY - 0.035, (dashZ + wheelZ) * 0.5);
   interiorGroup.add(wheelColumn);
 
   const steeringWheel = new THREE.Group();
-  steeringWheel.position.set(driverX, beltY + 0.26, dashZ + 0.31);
-  steeringWheel.rotation.x = -0.28;
+  steeringWheel.position.set(driverX, wheelY, wheelZ);
+  steeringWheel.rotation.x = -0.26;
 
-  const wheelRim = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.022, 10, 24), leatherMat);
+  const wheelRadius = 0.16;
+  const wheelRim = new THREE.Mesh(new THREE.TorusGeometry(wheelRadius, 0.022, 10, 24), leatherMat);
   steeringWheel.add(wheelRim);
 
   // Motorsport 12-o'clock top-center accent stripe on steering wheel rim
   const topMarker = new THREE.Mesh(new THREE.BoxGeometry(0.032, 0.046, 0.046), accentMat);
-  topMarker.position.set(0, 0.16, 0);
+  topMarker.position.set(0, wheelRadius, 0);
   steeringWheel.add(topMarker);
 
   // 3 brushed alloy spokes + carbon center airbag/logo hub
@@ -1016,6 +1034,31 @@ export function buildCartoonCar(
   const hubLogo = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.024, 0.044, 12), accentMat);
   hubLogo.rotation.x = Math.PI / 2;
   steeringWheel.add(hubLogo);
+
+  // Explicit 9-o'clock & 3-o'clock Skeletal IK Grip Targets rotating directly with the steering wheel rim
+  const leftGripTarget = new THREE.Object3D();
+  leftGripTarget.name = 'LeftSteeringGripTarget';
+  leftGripTarget.position.set(-wheelRadius, 0, 0.022);
+  leftGripTarget.quaternion.setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(
+      new THREE.Vector3(0, 1, 0),
+      new THREE.Vector3(0, 0, 1),
+      new THREE.Vector3(1, 0, 0)
+    )
+  );
+  steeringWheel.add(leftGripTarget);
+
+  const rightGripTarget = new THREE.Object3D();
+  rightGripTarget.name = 'RightSteeringGripTarget';
+  rightGripTarget.position.set(wheelRadius, 0, 0.022);
+  rightGripTarget.quaternion.setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(
+      new THREE.Vector3(0, -1, 0),
+      new THREE.Vector3(0, 0, 1),
+      new THREE.Vector3(-1, 0, 0)
+    )
+  );
+  steeringWheel.add(rightGripTarget);
 
   interiorGroup.add(steeringWheel);
 
@@ -1049,7 +1092,7 @@ export function buildCartoonCar(
     }
   });
 
-  // Realistic Seated 3D Driver gripping the steering wheel!
+  // Rigged Skeletal 3D Driver anchored in the seat & coupled via 2-bone IK to the rotating steering wheel!
   const useProHelmet =
     archetype === 'formula' ||
     archetype === 'gt' ||
@@ -1058,27 +1101,44 @@ export function buildCartoonCar(
     archetype === 'crown' ||
     archetype === 'rally' ||
     archetype === 'buggy';
-  const cabinHeadroom = Math.max(0.42, roofMaxY - (beltY - spec.rideHeight));
-  const driverScale = THREE.MathUtils.clamp(cabinHeadroom / 0.84, 0.68, 0.92);
+  const driverAnchor = new THREE.Group();
+  driverAnchor.name = 'DriverSeatAnchor';
+  driverAnchor.position.set(driverX, beltY - 0.02, seatZ + 0.02);
+  interiorGroup.add(driverAnchor);
+
   const driverRig = buildSeatedDriver({
     useHelmet: useProHelmet,
     suitColorHex: paintHex,
     accentHex,
     scale: driverScale,
   });
-  driverRig.root.position.set(driverX, beltY - 0.02, seatZ + 0.02);
-  interiorGroup.add(driverRig.root);
+  driverAnchor.add(driverRig.root);
+
+  const driverAnimator = new DriverSkeletalController(driverRig, leftGripTarget, rightGripTarget);
+  // Solve initial bind-to-wheel pose immediately so hands grip the wheel on frame 0
+  bodyGroup.updateMatrixWorld(true);
+  driverAnimator.update({
+    dt: 0.016,
+    steerInput: 0,
+    steeringWheelAngle: 0,
+    speedNorm: 0,
+    braking: false,
+    nitroActive: false,
+    lateralG: 0,
+    isCockpitCamera: false,
+    elapsed: 0,
+  });
 
   // Warm Interior Cabin Dome Light (fades on smoothly when doors open in the Garage!)
   const cabinLight = new THREE.PointLight(0xffedd5, 0, 3.8, 1.8);
   cabinLight.position.set(0, spec.rideHeight + roofMaxY - 0.08, seatZ - 0.12);
   interiorGroup.add(cabinLight);
 
-  // First-person Cockpit Interior Camera eye position (sees steering wheel, glowing gauges & road ahead!)
+  // First-person Cockpit Interior Camera eye position (looks right over animated hands, steering wheel & gauges!)
   const cockpitCameraOffset = new THREE.Vector3(
     driverX,
-    beltY + 0.56 * driverScale,
-    seatZ - 0.18
+    beltY + 0.62 * driverScale,
+    seatZ - 0.02
   );
 
   // Roof Cap, Slim Carbon A-Pillars & Shark-fin Antenna for closed-cabin cars
@@ -1784,7 +1844,13 @@ export function buildCartoonCar(
     paintMaterials: [paintMat],
     shieldMesh,
     steeringWheel,
-    driverHead: driverRig.headPivot,
+    leftGripTarget,
+    rightGripTarget,
+    driverHead: driverRig.bones.head,
+    driverAnchor,
+    driverScale,
+    driverRig,
+    driverAnimator,
     leftDoorPivot,
     rightDoorPivot,
     doorStyle,
