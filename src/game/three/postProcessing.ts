@@ -6,6 +6,20 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import type { EnvironmentId, GraphicsQuality } from '../types';
 
+export interface PostProcessOptions {
+  chromaticAberration: boolean;
+  filmGrain: boolean;
+  bloomEnabled: boolean;
+  reduceMotion: boolean;
+}
+
+export const DEFAULT_POST_OPTIONS: PostProcessOptions = {
+  chromaticAberration: true,
+  filmGrain: true,
+  bloomEnabled: true,
+  reduceMotion: false,
+};
+
 export interface CinematicGradePreset {
   exposure: number;
   bloomStrength: number;
@@ -241,7 +255,7 @@ const CinematicColorGradeShader = {
 
       // Split-toning (cool/rich shadows + warm/luminous highlights)
       float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-      float shadowWeight = smoothstep(0.58, 0.04, luma);
+      float shadowWeight = 1.0 - smoothstep(0.04, 0.58, luma);
       float highlightWeight = smoothstep(0.42, 0.96, luma);
       vec3 splitTone = mix(vec3(1.0), uShadowTint, shadowWeight * 0.65);
       splitTone = mix(splitTone, uHighlightTint, highlightWeight * 0.55);
@@ -263,7 +277,7 @@ const CinematicColorGradeShader = {
       color = mix(vec3(luma2), color, uSaturation + vibBoost);
 
       // Smooth cinematic vignette (subtly deepens framing at speed)
-      float vig = smoothstep(0.88, 0.88 - uVignetteSmoothness, radialDist);
+      float vig = 1.0 - smoothstep(0.88 - uVignetteSmoothness, 0.88, radialDist);
       color *= mix(1.0 - uVignetteIntensity, 1.0, vig);
 
       // Micro filmic dither / grain (prevents 8-bit banding on sky & wet asphalt)
@@ -286,6 +300,7 @@ export class CinematicPostProcessor {
   private isSoftwareGl: boolean;
   private quality: GraphicsQuality = 'high';
   private activeEnv: EnvironmentId = 'city';
+  private options: PostProcessOptions = { ...DEFAULT_POST_OPTIONS };
 
   // Smoothly damped current values (zero allocations in update)
   private currentExposure = 1.16;
@@ -376,6 +391,16 @@ export class CinematicPostProcessor {
     }
   }
 
+  public setOptions(options: Partial<PostProcessOptions>): void {
+    this.options = { ...this.options, ...options };
+    if (this.bloomPass) this.bloomPass.enabled = this.options.bloomEnabled;
+    if (this.colorGradePass) {
+      // Grading also carries grain/vignette; keep the pass for the base grade,
+      // but skip it when the user disables every optional effect on low tiers.
+      this.colorGradePass.enabled = this.quality !== 'low';
+    }
+  }
+
   public setQuality(quality: GraphicsQuality): void {
     this.quality = quality;
     if (this.isSoftwareGl || !this.composer) return;
@@ -386,11 +411,14 @@ export class CinematicPostProcessor {
         this.renderer.capabilities.isWebGL2 && quality === 'high' ? 4 : 0;
       if (this.renderTarget.samples !== targetSamples) {
         this.renderTarget.samples = targetSamples;
+        // EffectComposer keeps a second cloned target; reset() recreates BOTH
+        // buffers so the new MSAA sample count actually applies to every pass.
+        this.composer.reset(this.renderTarget);
       }
     }
 
     if (this.bloomPass) {
-      this.bloomPass.enabled = quality !== 'low';
+      this.bloomPass.enabled = quality !== 'low' && this.options.bloomEnabled;
     }
     if (this.colorGradePass) {
       this.colorGradePass.enabled = quality !== 'low';
@@ -398,13 +426,7 @@ export class CinematicPostProcessor {
 
     this.composer.setPixelRatio(pixelRatio);
     this.composer.setSize(this.width, this.height);
-    if (this.bloomPass) {
-      const scale = quality === 'medium' ? 0.38 : 0.5;
-      this.bloomPass.resolution.set(
-        Math.max(1, Math.floor(this.width * scale)),
-        Math.max(1, Math.floor(this.height * scale))
-      );
-    }
+    this.resizeBloom();
   }
 
   public resize(width: number, height: number): void {
@@ -415,13 +437,17 @@ export class CinematicPostProcessor {
     const pixelRatio = this.renderer.getPixelRatio();
     this.composer.setPixelRatio(pixelRatio);
     this.composer.setSize(this.width, this.height);
-    if (this.bloomPass) {
-      const scale = this.quality === 'medium' ? 0.38 : 0.5;
-      this.bloomPass.resolution.set(
-        Math.max(1, Math.floor(this.width * scale)),
-        Math.max(1, Math.floor(this.height * scale))
-      );
-    }
+    this.resizeBloom();
+  }
+
+  /** UnrealBloomPass only reallocates its mips through setSize(), not .resolution.set(). */
+  private resizeBloom(): void {
+    if (!this.bloomPass) return;
+    const scale = this.quality === 'medium' ? 0.38 : this.quality === 'high' ? 0.5 : 0.5;
+    this.bloomPass.setSize(
+      Math.max(1, Math.floor(this.width * scale)),
+      Math.max(1, Math.floor(this.height * scale))
+    );
   }
 
   private snapToPreset(p: CinematicGradePreset): void {
@@ -450,8 +476,9 @@ export class CinematicPostProcessor {
     const impact = THREE.MathUtils.clamp(state.impactPulse, 0, 1);
 
     const targetExposure = base.exposure + nitro * 0.08 + fever * 0.04 - impact * 0.14;
-    const targetBloomStrength =
-      base.bloomStrength + nitro * 0.24 + fever * 0.12 + impact * 0.28;
+    const targetBloomStrength = this.options.bloomEnabled
+      ? base.bloomStrength + nitro * 0.24 + fever * 0.12 + impact * 0.28
+      : 0;
     const targetBloomRadius = base.bloomRadius + nitro * 0.12;
     const targetBloomThreshold = Math.max(0.52, base.bloomThreshold - nitro * 0.08 - fever * 0.04);
 
@@ -460,9 +487,10 @@ export class CinematicPostProcessor {
     const targetVibrance = base.vibrance + nitro * 0.06;
     const targetVignette =
       base.vignetteIntensity + speed * 0.08 + nitro * 0.14 + impact * 0.26;
-    const targetChromatic = state.isGarage
-      ? 0
-      : nitro * 0.0042 + fever * 0.0014 + speed * 0.0008 + impact * 0.011;
+    const targetChromatic =
+      state.isGarage || !this.options.chromaticAberration || this.options.reduceMotion
+        ? 0
+        : nitro * 0.0042 + fever * 0.0014 + speed * 0.0008 + impact * 0.011;
 
     const lambda = 6.5;
     this.currentExposure = THREE.MathUtils.damp(this.currentExposure, targetExposure, lambda, dt);
@@ -517,7 +545,12 @@ export class CinematicPostProcessor {
       10,
       dt
     );
-    this.currentGrain = THREE.MathUtils.damp(this.currentGrain, base.grainAmount, lambda, dt);
+    this.currentGrain = THREE.MathUtils.damp(
+      this.currentGrain,
+      this.options.filmGrain && !this.options.reduceMotion ? base.grainAmount : 0,
+      lambda,
+      dt
+    );
 
     const tFactor = 1 - Math.exp(-lambda * dt);
     this.currentShadowTint.x += (base.shadowTint[0] - this.currentShadowTint.x) * tFactor;

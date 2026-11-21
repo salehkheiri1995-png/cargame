@@ -1,44 +1,65 @@
 import { SHOP_PRODUCTS } from '../data/economy';
-import type { SaveData, ShopProduct, ShopProductSku } from '../types';
+import type { ShopProduct, ShopProductSku } from '../types';
+import {
+  adProvider,
+  billingProvider,
+  monetizationMode,
+  type AdOutcome,
+  type AdProvider,
+  type AdSession,
+  type BillingProvider,
+  type PurchaseOutcome,
+  type RestoreOutcome,
+  type RewardedPlacement,
+} from './providers';
 
-export type RewardedPlacement =
-  | 'double_coins'
-  | 'revive_crash'
-  | 'free_coins_shop'
-  | 'daily_reward_2x'
-  | 'continue_level';
-
-export interface AdRequestResult {
-  completed: boolean;
-  grantNonce: string;
-}
-
-export interface PurchaseResult {
-  success: boolean;
-  cancelled?: boolean;
-  error?: string;
-  transactionId?: string;
-  sku: ShopProductSku;
-}
+export type { RewardedPlacement } from './providers';
+export {
+  adProvider,
+  billingProvider,
+  monetizationMode,
+} from './providers';
 
 /**
- * Decoupled Ad & IAP Architecture matching Unity C# interfaces:
- * - IAdProvider (Tapsell Plus / AdMob adapter on Android; Sandbox simulator on Web)
- * - IBillingProvider (Cafe Bazaar Poolakey SDK on Android; Sandbox test verifier on Web)
+ * Small orchestration layer over the provider contracts:
+ * - banner/interstitial frequency policy (pure UI concerns)
+ * - product lookup for the shop UI
+ * - provider access so UI code never fabricates transactions
+ *
+ * Reward grants are NOT implemented here. Callers go through validated
+ * economy operations keyed by the race/mission ID, so duplicate ad callbacks
+ * and duplicate purchases are safe.
  */
 class MonetizationService {
   private racesSinceLastInterstitial = 0;
-  private consumedRewardNonces = new Set<string>();
   private readonly INTERSTITIAL_FREQUENCY = 2; // Show interstitial every 2 races max
+
+  public get mode() {
+    return monetizationMode;
+  }
+
+  public get isSandbox(): boolean {
+    return billingProvider.isSandbox || adProvider.isSandbox;
+  }
+
+  public get billing(): BillingProvider {
+    return billingProvider;
+  }
+
+  public get ads(): AdProvider {
+    return adProvider;
+  }
 
   public shouldShowBanner(removeAdsOwned: boolean, isGameplay: boolean): boolean {
     if (isGameplay) return false; // Never show banners during driving
     if (removeAdsOwned) return false;
-    return true;
+    return adProvider.isRewardedAvailable('free_coins_shop') || billingProvider.isSandbox;
   }
 
   public shouldShowInterstitial(removeAdsOwned: boolean): boolean {
     if (removeAdsOwned) return false;
+    // Production ads are not configured yet: never simulate an interstitial there.
+    if (!adProvider.isSandbox && !adProvider.isRewardedAvailable('double_coins')) return false;
     this.racesSinceLastInterstitial++;
     if (this.racesSinceLastInterstitial >= this.INTERSTITIAL_FREQUENCY) {
       this.racesSinceLastInterstitial = 0;
@@ -47,78 +68,28 @@ class MonetizationService {
     return false;
   }
 
-  public createRewardNonce(placement: RewardedPlacement): string {
-    return `rw_${placement}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  }
-
-  public consumeRewardNonce(nonce: string): boolean {
-    if (!nonce || this.consumedRewardNonces.has(nonce)) {
-      return false; // Prevents duplicate reward grants
-    }
-    this.consumedRewardNonces.add(nonce);
-    return true;
-  }
-
   public getProductBySku(sku: ShopProductSku): ShopProduct | undefined {
     return SHOP_PRODUCTS.find((p) => p.sku === sku);
   }
 
-  /**
-   * Applies verified purchase entitlements to SaveData safely with duplicate-transaction guard.
-   */
-  public applyVerifiedPurchase(
-    save: SaveData,
-    sku: ShopProductSku,
-    transactionId: string
-  ): { nextSave: SaveData; applied: boolean } {
-    if (save.processedTransactions.includes(transactionId)) {
-      return { nextSave: save, applied: false };
-    }
-    const product = this.getProductBySku(sku);
-    if (!product) {
-      return { nextSave: save, applied: false };
-    }
-
-    // Prevent re-purchasing non-consumables
-    if (!product.consumable) {
-      if (sku === 'remove_ads' && save.removeAdsOwned) return { nextSave: save, applied: false };
-      if (sku === 'starter_pack' && save.starterPackOwned) return { nextSave: save, applied: false };
-      if (sku === 'premium_car' && save.premiumCarOwned) return { nextSave: save, applied: false };
-    }
-
-    const ownedCars = [...save.ownedCars];
-    if (product.carGrantId && !ownedCars.includes(product.carGrantId)) {
-      ownedCars.push(product.carGrantId);
-    }
-
-    const nextSave: SaveData = {
-      ...save,
-      coins: save.coins + (product.coinsGrant ?? 0),
-      ownedCars,
-      removeAdsOwned: save.removeAdsOwned || Boolean(product.removesAds),
-      starterPackOwned: save.starterPackOwned || sku === 'starter_pack',
-      premiumCarOwned: save.premiumCarOwned || sku === 'premium_car',
-      processedTransactions: [...save.processedTransactions, transactionId],
-    };
-
-    return { nextSave, applied: true };
+  public isRewardedAvailable(placement: RewardedPlacement): boolean {
+    return adProvider.isRewardedAvailable(placement);
   }
 
-  public restorePermanentPurchases(save: SaveData): SaveData {
-    // On Android, this queries Cafe Bazaar Poolakey `getPurchasedProducts()`
-    // and reconciles non-consumables (`remove_ads`, `starter_pack`, `premium_car`).
-    const ownedCars = [...save.ownedCars];
-    if (save.starterPackOwned && !ownedCars.includes('turbo_coupe')) {
-      ownedCars.push('turbo_coupe');
-    }
-    if (save.premiumCarOwned && !ownedCars.includes('golden_phantom')) {
-      ownedCars.push('golden_phantom');
-    }
-    return {
-      ...save,
-      ownedCars,
-      removeAdsOwned: save.removeAdsOwned || save.starterPackOwned,
-    };
+  public beginRewarded(placement: RewardedPlacement): AdSession | null {
+    return adProvider.beginRewarded(placement);
+  }
+
+  public completeAd(session: AdSession): AdOutcome {
+    return session.complete();
+  }
+
+  public purchase(sku: ShopProductSku): Promise<PurchaseOutcome> {
+    return billingProvider.purchase(sku);
+  }
+
+  public restore(): Promise<RestoreOutcome> {
+    return billingProvider.restore();
   }
 }
 

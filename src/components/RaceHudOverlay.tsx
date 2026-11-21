@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Camera,
   ChevronLeft,
@@ -15,10 +15,11 @@ import {
   Zap,
 } from 'lucide-react';
 import { TOTAL_LEVELS } from '../game/data/levels';
-import { formatMissionGoal, formatNumber, t } from '../game/i18n';
+import { formatMissionGoal, formatNumber, getMissionTypeLabel, t } from '../game/i18n';
 import type {
   ActiveRaceConfig,
   ControlScheme,
+  GameSettings,
   Language,
   RaceHudSnapshot,
   RaceResult,
@@ -29,7 +30,7 @@ interface RaceHudOverlayProps {
   lang: Language;
   raceConfig: ActiveRaceConfig;
   hud: RaceHudSnapshot;
-  controlScheme: ControlScheme;
+  settings: GameSettings;
   paused: boolean;
   result: RaceResult | null;
   coinsDoubled: boolean;
@@ -43,6 +44,8 @@ interface RaceHudOverlayProps {
   onTouchControl: (ctrl: 'left' | 'right' | 'brake' | 'nitro', pressed: boolean) => void;
   onTouchSteerAxis: (axis: number) => void;
   onChangeControlScheme?: (scheme: ControlScheme) => void;
+  onDismissTutorial?: () => void;
+  showTutorial?: boolean;
 }
 
 const triggerHaptic = (ms = 10) => {
@@ -59,7 +62,7 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
   lang,
   raceConfig,
   hud,
-  controlScheme,
+  settings,
   paused,
   result,
   coinsDoubled,
@@ -73,17 +76,84 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
   onTouchControl,
   onTouchSteerAxis,
   onChangeControlScheme,
+  onDismissTutorial,
+  showTutorial,
 }) => {
   const dragOriginX = useRef<number | null>(null);
+  const dragPointerId = useRef<number | null>(null);
   const wheelOriginX = useRef<number | null>(null);
+  const wheelPointerId = useRef<number | null>(null);
   const [steerUiAxis, setSteerUiAxis] = useState(0);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  const tutorialVisible = Boolean(showTutorial) || tutorialOpen;
+  const btnPointers = useRef<Record<'left' | 'right' | 'brake' | 'nitro', number | null>>({
+    left: null,
+    right: null,
+    brake: null,
+    nitro: null,
+  });
   const [pressedBtns, setPressedBtns] = useState({
     left: false,
     right: false,
     brake: false,
     nitro: false,
   });
+  const controlScheme = settings.controlScheme;
   const lvl = raceConfig.levelConfig;
+
+  const resetControls = useCallback(() => {
+    dragOriginX.current = null;
+    dragPointerId.current = null;
+    wheelOriginX.current = null;
+    wheelPointerId.current = null;
+    btnPointers.current = { left: null, right: null, brake: null, nitro: null };
+    setSteerUiAxis(0);
+    setPressedBtns((prev) =>
+      prev.left || prev.right || prev.brake || prev.nitro
+        ? { left: false, right: false, brake: false, nitro: false }
+        : prev
+    );
+    onTouchControl('left', false);
+    onTouchControl('right', false);
+    onTouchControl('brake', false);
+    onTouchControl('nitro', false);
+    onTouchSteerAxis(0);
+  }, [onTouchControl, onTouchSteerAxis]);
+
+  // Release every touch when the overlay is paused/ended, the tab is hidden,
+  // or the window loses focus. Prevents stuck steering after an ad or tab switch.
+  useEffect(() => {
+    if (paused || Boolean(result)) {
+      resetControls();
+    }
+  }, [paused, result, resetControls]);
+
+  useEffect(() => {
+    const onHide = () => resetControls();
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') resetControls();
+    };
+    window.addEventListener('blur', onHide);
+    window.addEventListener('pointercancel', onHide);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', onHide);
+      window.removeEventListener('pointercancel', onHide);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [resetControls]);
+
+  const applyAxis = useCallback(
+    (raw: number) => {
+      const dead = Math.max(0, Math.min(0.2, settings.steeringDeadZone));
+      const magnitude = Math.abs(raw);
+      const shaped = magnitude <= dead ? 0 : (magnitude - dead) / (1 - dead);
+      const axis = Math.sign(raw) * Math.max(0, Math.min(1, shaped));
+      setSteerUiAxis(axis);
+      onTouchSteerAxis(axis);
+    },
+    [settings.steeringDeadZone, onTouchSteerAxis]
+  );
 
   const setBtnState = (ctrl: 'left' | 'right' | 'brake' | 'nitro', active: boolean) => {
     setPressedBtns((prev) => (prev[ctrl] === active ? prev : { ...prev, [ctrl]: active }));
@@ -93,62 +163,84 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
   const makeTouchBtnHandlers = (ctrl: 'left' | 'right' | 'brake' | 'nitro', hapticMs = 8) => ({
     onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
       e.preventDefault();
+      if (btnPointers.current[ctrl] !== null) return;
+      btnPointers.current[ctrl] = e.pointerId;
       e.currentTarget.setPointerCapture(e.pointerId);
       triggerHaptic(hapticMs);
       setBtnState(ctrl, true);
     },
     onPointerUp: (e: React.PointerEvent<HTMLButtonElement>) => {
       e.preventDefault();
+      if (btnPointers.current[ctrl] !== e.pointerId) return;
+      btnPointers.current[ctrl] = null;
       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
         e.currentTarget.releasePointerCapture(e.pointerId);
       }
       setBtnState(ctrl, false);
     },
-    onPointerCancel: () => setBtnState(ctrl, false),
-    onLostPointerCapture: () => setBtnState(ctrl, false),
+    onPointerCancel: (e: React.PointerEvent<HTMLButtonElement>) => {
+      if (btnPointers.current[ctrl] !== e.pointerId) return;
+      btnPointers.current[ctrl] = null;
+      setBtnState(ctrl, false);
+    },
+    onLostPointerCapture: (e: React.PointerEvent<HTMLButtonElement>) => {
+      if (btnPointers.current[ctrl] !== e.pointerId) return;
+      btnPointers.current[ctrl] = null;
+      setBtnState(ctrl, false);
+    },
   });
 
   const handleDragStart = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    if (dragPointerId.current !== null) return;
+    dragPointerId.current = e.pointerId;
     e.currentTarget.setPointerCapture(e.pointerId);
     dragOriginX.current = e.clientX;
   };
   const handleDragMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (dragOriginX.current === null) return;
+    if (dragPointerId.current !== e.pointerId || dragOriginX.current === null) return;
     const dx = e.clientX - dragOriginX.current;
-    const axis = Math.max(-1, Math.min(1, dx / 68));
-    setSteerUiAxis(axis);
-    onTouchSteerAxis(axis);
+    applyAxis(Math.max(-1, Math.min(1, dx / 68)));
   };
-  const handleDragEnd = () => {
+  const handleDragEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragPointerId.current !== e.pointerId) return;
+    dragPointerId.current = null;
     dragOriginX.current = null;
-    setSteerUiAxis(0);
-    onTouchSteerAxis(0);
+    applyAxis(0);
   };
 
   const handleWheelStart = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    if (wheelPointerId.current !== null) return;
+    wheelPointerId.current = e.pointerId;
     e.currentTarget.setPointerCapture(e.pointerId);
     wheelOriginX.current = e.clientX;
     triggerHaptic(8);
   };
   const handleWheelMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (wheelOriginX.current === null) return;
+    if (wheelPointerId.current !== e.pointerId || wheelOriginX.current === null) return;
     const dx = e.clientX - wheelOriginX.current;
-    const axis = Math.max(-1, Math.min(1, dx / 62));
-    setSteerUiAxis(axis);
-    onTouchSteerAxis(axis);
+    applyAxis(Math.max(-1, Math.min(1, dx / 62)));
   };
-  const handleWheelEnd = () => {
+  const handleWheelEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (wheelPointerId.current !== e.pointerId) return;
+    wheelPointerId.current = null;
     wheelOriginX.current = null;
-    setSteerUiAxis(0);
-    onTouchSteerAxis(0);
+    applyAxis(0);
   };
 
   const nitroPercent = Math.max(0, Math.min(100, hud.nitro));
+  const resultTotal = result
+    ? result.coinsCollected +
+      Math.max(0, result.missionBonusCoins) +
+      (coinsDoubled ? result.coinsCollected : 0)
+    : 0;
   const showHudControls = !paused && !result;
   const speedStreakOpacity =
-    showHudControls && (hud.nitroActive || hud.speedKmh > 175)
+    showHudControls &&
+    !settings.reduceMotion &&
+    settings.speedLines &&
+    (hud.nitroActive || hud.speedKmh > 175)
       ? Math.min(0.65, hud.nitroActive ? 0.58 : (hud.speedKmh - 175) / 140)
       : 0;
 
@@ -183,6 +275,11 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
       {/* Active Low-Occlusion HUD (pointer-events-none wrapper, Android safe-area ready!) */}
       <div className="fixed inset-0 z-20 flex flex-col justify-between safe-area-hud sm:p-4 pointer-events-none">
         {/* Top Perimeter Telemetry */}
+        <div className="pointer-events-none absolute inset-x-0 top-16 flex justify-center px-4 portrait:flex landscape:hidden">
+          <div className="cartoon-hud-chip px-3 py-1 rounded-xl text-[11px] font-bold text-sky-200">
+            📱 {t(lang, 'portraitHint')}
+          </div>
+        </div>
         <div className="flex items-start justify-between gap-2">
           {/* Score, Distance, Coins */}
           <div className="flex flex-wrap items-center gap-2">
@@ -222,6 +319,7 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
             <div className="hidden md:flex flex-col items-center cartoon-hud-chip px-4 py-1.5 rounded-xl min-w-[230px]">
               <div className="w-full flex items-center justify-between gap-3 text-[11px] font-bold">
                 <span className="text-amber-300 truncate">
+                  {getMissionTypeLabel(lang, lvl.missionType)} ·{' '}
                   {formatMissionGoal(lang, lvl.missionType, lvl.target)}
                 </span>
                 {hud.timeRemaining !== null && (
@@ -234,11 +332,17 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
                   </span>
                 )}
               </div>
-              <div className="w-full h-2 bg-slate-950 rounded-full overflow-hidden mt-1">
-                <div
-                  className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 transition-all duration-100"
-                  style={{ width: `${Math.round(hud.missionProgress * 100)}%` }}
-                />
+              <div className="w-full flex items-center justify-between gap-2 mt-1">
+                <span className="text-[10px] font-black text-white/80 tabular-nums">
+                  {formatNumber(hud.missionCurrent, lang)} /{' '}
+                  {formatNumber(hud.missionTarget, lang)}
+                </span>
+                <div className="flex-1 h-2 bg-slate-950 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-emerald-400 to-sky-400 transition-all duration-100"
+                    style={{ width: `${Math.round(hud.missionProgress * 100)}%` }}
+                  />
+                </div>
               </div>
             </div>
           )}
@@ -314,12 +418,13 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
 
         {/* Mobile Compact Level Mission Bar */}
         {lvl && (
-          <div className="md:hidden self-center cartoon-hud-chip px-3 py-1 rounded-xl flex items-center gap-2 text-[11px] font-bold mt-1">
+          <div className="md:hidden self-center cartoon-hud-chip px-3 py-1 rounded-xl flex flex-col items-center gap-0.5 text-[11px] font-bold mt-1">
             <span className="text-amber-300">
+              {getMissionTypeLabel(lang, lvl.missionType)} ·{' '}
               {formatNumber(hud.missionCurrent, lang)} / {formatNumber(hud.missionTarget, lang)}
             </span>
             {hud.timeRemaining !== null && (
-              <span className="text-white tabular-nums">· {Math.ceil(hud.timeRemaining)}s</span>
+              <span className="text-white tabular-nums">⏱ {Math.ceil(hud.timeRemaining)}s</span>
             )}
           </div>
         )}
@@ -367,10 +472,17 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
         {/* Bottom Android-First Multi-Touch Steering & Ergonomic Pedals */}
         {showHudControls && (
           <div
-            dir="ltr"
+            dir={settings.leftHanded ? 'rtl' : 'ltr'}
             className="flex items-end justify-between gap-3 pb-1 pointer-events-auto"
+            style={{ opacity: settings.controlOpacity }}
           >
             {/* Left Thumb Zone: Multi-Touch Buttons, Real Touch Steering Wheel, or Proportional Slider */}
+            <div
+              style={{
+                transform: `scale(${settings.controlScale})`,
+                transformOrigin: settings.leftHanded ? 'bottom right' : 'bottom left',
+              }}
+            >
             {controlScheme === 'buttons' ? (
               <div className="flex items-center gap-3">
                 <button
@@ -462,6 +574,7 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
                 </div>
               </div>
             )}
+            </div>
 
             {/* Subtle Desktop Hint */}
             <div className="hidden lg:block px-3 py-1 rounded-lg bg-slate-950/75 border border-white/10 text-[11px] font-semibold text-slate-300">
@@ -469,7 +582,13 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
             </div>
 
             {/* Right Thumb Zone: Large Ergonomic Brake & Nitro Pedals */}
-            <div className="flex items-center gap-3">
+            <div
+              className="flex items-center gap-3"
+              style={{
+                transform: `scale(${settings.controlScale})`,
+                transformOrigin: settings.leftHanded ? 'bottom left' : 'bottom right',
+              }}
+            >
               <button
                 {...makeTouchBtnHandlers('brake', 12)}
                 className={`android-touch-pad w-18 h-20 sm:w-20 sm:h-22 rounded-2xl border-2 font-black text-xs sm:text-sm flex flex-col items-center justify-center cursor-pointer transition-transform ${
@@ -497,6 +616,64 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
           </div>
         )}
       </div>
+
+      {/* Pre-race countdown with the stage goal visible before driving */}
+      {hud.countdown > 0 && !paused && !result && (
+        <div className="fixed inset-0 z-20 flex flex-col items-center justify-center pointer-events-none">
+          <div className="text-[88px] sm:text-[120px] font-black text-white drop-shadow-[0_6px_24px_rgba(0,0,0,0.65)] tabular-nums leading-none">
+            {Math.ceil(hud.countdown)}
+          </div>
+          <div className="mt-2 px-4 py-2 rounded-2xl bg-slate-950/80 border-2 border-amber-300/70 text-center max-w-[90vw]">
+            <div className="text-amber-300 font-black text-sm sm:text-base">
+              {t(lang, 'getReady')}
+            </div>
+            {lvl && (
+              <div className="text-white text-xs sm:text-sm font-bold mt-0.5">
+                {t(lang, 'missionGoalLabel')}:{' '}
+                {formatMissionGoal(lang, lvl.missionType, lvl.target)}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Tutorial: first race (paused) or replayed from the pause menu */}
+      {tutorialVisible && (
+        <div className="fixed inset-0 z-40 bg-slate-950/90 flex items-center justify-center p-4">
+          <div className="w-full max-w-md cartoon-panel rounded-3xl p-6 space-y-4 text-start">
+            <h2 className="text-xl sm:text-2xl font-black text-white text-center">
+              {t(lang, 'tutorialTitle')}
+            </h2>
+            <p className="text-sm text-slate-200 leading-relaxed">{t(lang, 'tutorialBody')}</p>
+            <p className="text-xs text-sky-300 leading-relaxed bg-sky-950/50 border border-sky-400/30 rounded-xl p-3">
+              {t(lang, 'tutorialControls')}
+            </p>
+            <div className="grid grid-cols-2 gap-2 text-[11px] font-bold text-slate-300">
+              <div className="rounded-lg bg-slate-800/80 p-2">
+                {lang === 'fa' ? '⚡ نیترو: سرعت لحظه‌ای' : '⚡ Nitro: burst of speed'}
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-2">
+                {lang === 'fa' ? '🛡️ احیا: یک‌بار با تبلیغ' : '🛡️ Revive: once per run'}
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-2">
+                {lang === 'fa' ? '🪙 سکه: امتیاز حین مسیر' : '🪙 Coins: score on the road'}
+              </div>
+              <div className="rounded-lg bg-slate-800/80 p-2">
+                {lang === 'fa' ? '⏱️ زمان: در مراحل محدود' : '⏱️ Timers: level mode only'}
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                setTutorialOpen(false);
+                onDismissTutorial?.();
+              }}
+              className="arcade-btn w-full py-3 rounded-xl bg-gradient-to-b from-emerald-400 to-green-600 border-2 border-emerald-200 text-slate-950 font-black text-base cursor-pointer"
+            >
+              {t(lang, 'gotIt')}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Pause Modal */}
       {paused && !result && (
@@ -532,6 +709,13 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
                 </div>
               </div>
             )}
+
+            <button
+              onClick={() => setTutorialOpen(true)}
+              className="arcade-btn w-full py-2.5 rounded-xl bg-slate-800 border-2 border-sky-400/40 text-sky-200 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <span>{t(lang, 'tutorialTitle')}</span>
+            </button>
 
             <button
               onClick={onTogglePause}
@@ -616,10 +800,7 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
               />
               <StatRow
                 label={t(lang, 'coinsEarnedLabel')}
-                value={`+${formatNumber(
-                  coinsDoubled ? result.coinsCollected * 2 : result.coinsCollected,
-                  lang
-                )}`}
+                value={`+${formatNumber(result.coinsCollected, lang)}`}
                 accent="text-yellow-300"
               />
               <StatRow
@@ -629,11 +810,23 @@ export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
               />
               {result.missionBonusCoins > 0 && (
                 <StatRow
-                  label={t(lang, 'bonusRewardLabel')}
+                  label={t(lang, 'stageBonusLabel')}
                   value={`+${formatNumber(result.missionBonusCoins, lang)}`}
                   accent="text-amber-300"
                 />
               )}
+              {coinsDoubled && (
+                <StatRow
+                  label={t(lang, 'adBonusLabel')}
+                  value={`+${formatNumber(result.coinsCollected, lang)}`}
+                  accent="text-orange-300"
+                />
+              )}
+              <StatRow
+                label={t(lang, 'totalEarnedLabel')}
+                value={`+${formatNumber(resultTotal, lang)}`}
+                accent="text-yellow-200"
+              />
               <StatRow
                 label={t(lang, 'peakSpeedLabel')}
                 value={`${formatNumber(result.peakSpeedKmh, lang)} ${t(lang, 'hudSpeedUnit')}`}

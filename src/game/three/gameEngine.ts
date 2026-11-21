@@ -6,7 +6,9 @@ import { VEHICLE_MAP } from '../data/vehicles';
 import { audioEngine } from '../services/audioEngine';
 import type {
   ActiveRaceConfig,
+  DebugStats,
   EnvironmentId,
+  GameSettings,
   GraphicsQuality,
   Language,
   RaceHudSnapshot,
@@ -101,6 +103,8 @@ interface PooledParticle {
 export interface GameEngineCallbacks {
   onHudUpdate: (snapshot: RaceHudSnapshot) => void;
   onRaceEnd: (result: RaceResult) => void;
+  /** Dev-only telemetry; omitted in production builds. */
+  onDebugStats?: (stats: DebugStats) => void;
 }
 
 // Module-scope reusable helpers (zero GC inside animation loop)
@@ -140,6 +144,21 @@ export class TurboRoadEngine {
   private maxAnisotropy: number;
   private isSoftwareGl: boolean;
   private graphicsQuality: GraphicsQuality = 'high';
+  private effectiveQuality: 'low' | 'medium' | 'high' = 'high';
+  private envRenderTarget: THREE.WebGLRenderTarget | null = null;
+
+  // Adaptive quality (Auto) & frame telemetry
+  private autoRenderScale = 0.85;
+  private frameTimeAvgMs = 16.7;
+  private frameTimeJitterMs = 0;
+  private qualityCooldown = 2;
+  private debugTimer = 0;
+  private lastDebugStats: DebugStats | null = null;
+
+  // Gameplay settings applied live
+  private steeringSensitivity = 1;
+  private baseHandlingRate = 12;
+  private shakeScale = 1;
 
   private worldRig: WorldRig | null = null;
   private currentEnvId: EnvironmentId = 'city';
@@ -217,6 +236,7 @@ export class TurboRoadEngine {
   private rivalAheadDist: number | null = null;
   private nextRivalDist = 240;
   private raceTime = 0;
+  private raceCountdown = 0;
   private peakSpeedKmh = 0;
   private checkpointsPassed = 0;
   private nextCheckpointDist = 200;
@@ -281,7 +301,10 @@ export class TurboRoadEngine {
 
     // Studio environment reflection via RoomEnvironment (all devices!)
     const pmrem = new THREE.PMREMGenerator(this.renderer);
-    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.035).texture;
+    const roomEnvironment = new RoomEnvironment();
+    this.envRenderTarget = pmrem.fromScene(roomEnvironment, 0.035);
+    this.scene.environment = this.envRenderTarget.texture;
+    roomEnvironment.dispose();
     pmrem.dispose();
 
     this.camera = new THREE.PerspectiveCamera(60, initW / initH, 0.2, 360);
@@ -599,28 +622,91 @@ export class TurboRoadEngine {
 
   public setGraphicsQuality(quality: GraphicsQuality): void {
     this.graphicsQuality = quality;
-    if (this.isSoftwareGl) {
-      this.renderer.setPixelRatio(1);
-      return;
+    if (quality === 'auto') {
+      // Start conservatively, then let the frame-time governor move up.
+      this.effectiveQuality = this.isSoftwareGl ? 'low' : 'medium';
+      this.autoRenderScale = this.isSoftwareGl ? 0.7 : 0.85;
+      this.qualityCooldown = 2;
+    } else {
+      this.effectiveQuality = quality;
+      this.autoRenderScale = 1;
     }
-    if (quality === 'low') {
+    this.applyEffectiveQuality();
+  }
+
+  private applyEffectiveQuality(): void {
+    const quality = this.effectiveQuality;
+    if (this.isSoftwareGl) {
       this.renderer.setPixelRatio(1);
       this.renderer.shadowMap.enabled = false;
       this.sunLight.castShadow = false;
-    } else if (quality === 'medium') {
-      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-      this.renderer.shadowMap.enabled = true;
-      this.sunLight.castShadow = true;
-    } else {
-      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      this.renderer.shadowMap.enabled = true;
-      this.sunLight.castShadow = true;
+      this.postProcessor.setQuality(quality);
+      return;
     }
+
+    const cap = quality === 'high' ? 2 : quality === 'medium' ? 1.5 : 1;
+    const deviceScale = Math.min(window.devicePixelRatio || 1, cap);
+    this.renderer.setPixelRatio(Math.max(0.6, deviceScale * this.autoRenderScale));
+    this.renderer.shadowMap.enabled = quality !== 'low';
+    this.sunLight.castShadow = quality !== 'low';
     this.postProcessor.setQuality(quality);
   }
 
-  private syncCarHeadlightBeams(): void {
-    if (!this.playerCar) return;
+  /** Applies player-facing settings live (sensitivity, shake, effect toggles). */
+  public applyGameSettings(settings: GameSettings): void {
+    this.steeringSensitivity = Math.max(0.5, Math.min(1.5, settings.steeringSensitivity));
+    this.handlingRate = this.baseHandlingRate * this.steeringSensitivity;
+    this.shakeScale = settings.reduceMotion
+      ? 0
+      : Math.max(0, Math.min(1.5, settings.shakeIntensity));
+    this.postProcessor.setOptions({
+      chromaticAberration: settings.chromaticAberration,
+      filmGrain: settings.filmGrain,
+      bloomEnabled: settings.bloomEnabled,
+      reduceMotion: settings.reduceMotion,
+    });
+  }
+
+  /**
+   * Disposes every geometry/material owned by a rig. Textures shared with the
+   * engine (contact shadow, tire tread, carbon, boost pad, PMREM environment)
+   * are explicitly protected from double disposal.
+   */
+  private disposeObjectTree(root: THREE.Object3D): void {
+    const protectedTextures = new Set<THREE.Texture>([
+      this.shadowTexture,
+      this.tireTreadTexture,
+      this.carbonTexture,
+      this.boostPadTexture,
+    ]);
+    if (this.scene.environment) protectedTextures.add(this.scene.environment);
+
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.geometry) geometries.add(mesh.geometry);
+      const material = (mesh as THREE.Mesh).material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (Array.isArray(material)) material.forEach((m) => materials.add(m));
+      else if (material) materials.add(material);
+    });
+
+    geometries.forEach((g) => g.dispose());
+    materials.forEach((mat) => {
+      for (const value of Object.values(mat as unknown as Record<string, unknown>)) {
+        if (value && (value as THREE.Texture).isTexture) {
+          const texture = value as THREE.Texture;
+          if (!protectedTextures.has(texture)) texture.dispose();
+        }
+      }
+      mat.dispose();
+    });
+  }
+
+  private syncCarHeadlightBeams(): void {    if (!this.playerCar) return;
     const env = ENVIRONMENT_MAP[this.currentEnvId];
     const showBeams = Boolean(env.isNight || env.id === 'sunsetCanyon');
     this.playerCar.headlightBeams.forEach((b) => {
@@ -667,6 +753,7 @@ export class TurboRoadEngine {
 
     if (this.playerCar) {
       this.scene.remove(this.playerCar.root);
+      this.disposeObjectTree(this.playerCar.root);
       this.playerCar = null;
     }
 
@@ -827,7 +914,9 @@ export class TurboRoadEngine {
     this.baseMaxSpeed = 37 + (s.speed / 100) * 33;
     this.nitroMaxSpeed = this.baseMaxSpeed + 15 + (s.nitro / 100) * 18;
     this.accelRate = 12.5 + (s.accel / 100) * 16.5;
-    this.handlingRate = (8.8 + (s.handling / 100) * 7.5) * config.steeringSensitivity;
+    this.steeringSensitivity = config.steeringSensitivity;
+    this.baseHandlingRate = 8.8 + (s.handling / 100) * 7.5;
+    this.handlingRate = this.baseHandlingRate * this.steeringSensitivity;
     this.brakingRate = 24 + (s.braking / 100) * 24;
     this.nitroDrainRate = 28 - (s.nitro / 100) * 10;
 
@@ -853,6 +942,7 @@ export class TurboRoadEngine {
     const isRivalLevel = config.levelConfig?.missionType === 'rivals';
     this.nextRivalDist = isRivalLevel ? 60 : 230;
     this.raceTime = 0;
+    this.raceCountdown = 2.6;
     this.peakSpeedKmh = 0;
     this.checkpointsPassed = 0;
     this.nextCheckpointDist = 180;
@@ -903,6 +993,7 @@ export class TurboRoadEngine {
     this.crashFreezeTimer = 0;
     this.paused = false;
     this.shieldTimer = 3.2;
+    this.raceCountdown = 1.3;
     this.playerSpeed = Math.max(24, this.baseMaxSpeed * 0.62);
     this.nitro = Math.max(this.nitro, 50);
 
@@ -1294,6 +1385,18 @@ export class TurboRoadEngine {
     }
 
     if (this.paused || this.raceFinished) return;
+
+    if (this.raceCountdown > 0) {
+      this.raceCountdown = Math.max(0, this.raceCountdown - dt);
+      this.updateParticles(dt);
+      this.updateShakeCamera(dt);
+      this.hudEmitTimer += dt;
+      if (this.hudEmitTimer >= 0.05) {
+        this.hudEmitTimer = 0;
+        this.emitHud();
+      }
+      return;
+    }
 
     this.raceTime += dt;
     if (this.shieldTimer > 0) this.shieldTimer = Math.max(0, this.shieldTimer - dt);
@@ -2224,9 +2327,10 @@ export class TurboRoadEngine {
   }
 
   private updateShakeCamera(dt: number): void {
-    if (this.shakeIntensity > 0.005) {
-      this.camera.position.x += (Math.random() - 0.5) * this.shakeIntensity;
-      this.camera.position.y += (Math.random() - 0.5) * this.shakeIntensity * 0.8;
+    const shake = this.shakeIntensity * this.shakeScale;
+    if (shake > 0.005) {
+      this.camera.position.x += (Math.random() - 0.5) * shake;
+      this.camera.position.y += (Math.random() - 0.5) * shake * 0.8;
       this.shakeIntensity = THREE.MathUtils.damp(this.shakeIntensity, 0, 8, dt);
     }
   }
@@ -2400,6 +2504,7 @@ export class TurboRoadEngine {
       rivalAheadDist: this.rivalAheadDist,
       rivalsDefeated: this.rivalsDefeated,
       cameraMode: this.cameraMode,
+      countdown: this.raceCountdown,
     });
   }
 
@@ -2427,12 +2532,97 @@ export class TurboRoadEngine {
     this.frameId = window.setTimeout(poll, 5);
   }
 
+  private trackPerformance(rawDt: number): void {
+    if (!Number.isFinite(rawDt) || rawDt <= 0) return;
+    // Ignore tab-return / debugger spikes instead of misreading them as load.
+    if (rawDt > 0.25) {
+      this.frameTimeAvgMs = 16.7;
+      this.frameTimeJitterMs = 0;
+      return;
+    }
+    const ms = rawDt * 1000;
+    this.frameTimeAvgMs += (ms - this.frameTimeAvgMs) * 0.08;
+    this.frameTimeJitterMs +=
+      (Math.abs(ms - this.frameTimeAvgMs) - this.frameTimeJitterMs) * 0.05;
+  }
+
+  private updateAdaptiveQuality(rawDt: number): void {
+    if (this.graphicsQuality !== 'auto' || this.isSoftwareGl) return;
+    if (this.paused || this.viewMode !== 'racing') return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
+    this.qualityCooldown -= rawDt;
+    if (this.qualityCooldown > 0) return;
+
+    let changed = false;
+    if (this.frameTimeAvgMs > 24) {
+      if (this.autoRenderScale > 0.62) {
+        this.autoRenderScale = Math.max(0.6, this.autoRenderScale - 0.1);
+        changed = true;
+      } else if (this.effectiveQuality === 'high') {
+        this.effectiveQuality = 'medium';
+        this.autoRenderScale = 0.85;
+        changed = true;
+      } else if (this.effectiveQuality === 'medium') {
+        this.effectiveQuality = 'low';
+        this.autoRenderScale = 1;
+        changed = true;
+      }
+      this.qualityCooldown = 2.5;
+    } else if (this.frameTimeAvgMs < 13.5) {
+      if (this.effectiveQuality === 'low') {
+        this.effectiveQuality = 'medium';
+        this.autoRenderScale = 0.85;
+        changed = true;
+      } else if (this.autoRenderScale < 1) {
+        this.autoRenderScale = Math.min(1, this.autoRenderScale + 0.05);
+        changed = true;
+      } else if (this.effectiveQuality === 'medium') {
+        this.effectiveQuality = 'high';
+        changed = true;
+      }
+      this.qualityCooldown = 4;
+    }
+
+    if (changed) this.applyEffectiveQuality();
+  }
+
+  private emitDebugStats(rawDt: number): void {
+    if (!this.callbacks.onDebugStats) return;
+    this.debugTimer += rawDt;
+    if (this.debugTimer < 0.5) return;
+    this.debugTimer = 0;
+
+    const info = this.renderer.info;
+    const stats: DebugStats = {
+      fps: Math.round(1000 / Math.max(1, this.frameTimeAvgMs)),
+      frameTimeMs: Math.round(this.frameTimeAvgMs * 10) / 10,
+      frameTimeJitterMs: Math.round(this.frameTimeJitterMs * 10) / 10,
+      drawCalls: info.render.calls,
+      triangles: info.render.triangles,
+      geometries: info.memory.geometries,
+      textures: info.memory.textures,
+      pixelRatio: Math.round(this.renderer.getPixelRatio() * 100) / 100,
+      qualitySetting: this.graphicsQuality,
+      effectiveQuality: this.effectiveQuality,
+      autoRenderScale: Math.round(this.autoRenderScale * 100) / 100,
+      activeTraffic: this.trafficPool.filter((t) => t.active).length,
+      activeCoins: this.coinPool.filter((c) => c.active).length,
+      activeParticles: this.particlePool.filter((p) => p.active).length,
+    };
+    this.lastDebugStats = stats;
+    this.callbacks.onDebugStats(stats);
+  }
+
   private tick = (now = performance.now()): void => {
     if (this.destroyed) return;
     const rawDt = (now - this.lastTimestamp) / 1000;
     this.lastTimestamp = now;
     const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
     this.elapsedTotal += dt;
+
+    this.trackPerformance(rawDt);
+    this.updateAdaptiveQuality(rawDt);
 
     if (this.viewMode === 'racing') {
       this.updateRacing(dt);
@@ -2460,6 +2650,7 @@ export class TurboRoadEngine {
     });
 
     this.postProcessor.render(this.scene, this.camera);
+    this.emitDebugStats(rawDt);
 
     if (this.isSoftwareGl) {
       this.afterDraw(() => this.tick(performance.now()));
@@ -2535,6 +2726,14 @@ export class TurboRoadEngine {
     this.isDraggingTurntable = false;
   };
 
+  private handleVisibilityChange = (): void => {
+    this.lastTimestamp = performance.now();
+    this.qualityCooldown = 2;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      this.resetInputs();
+    }
+  };
+
   private handleContextLost = (e: Event): void => {
     e.preventDefault();
   };
@@ -2544,6 +2743,7 @@ export class TurboRoadEngine {
     window.addEventListener('keydown', this.handleKeyDown);
     window.addEventListener('keyup', this.handleKeyUp);
     window.addEventListener('blur', this.handleWindowBlur);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
     this.renderer.domElement.addEventListener('pointerdown', this.handlePointerDown);
     window.addEventListener('pointermove', this.handlePointerMove);
     window.addEventListener('pointerup', this.handlePointerUp);
@@ -2551,6 +2751,7 @@ export class TurboRoadEngine {
   }
 
   public dispose(): void {
+    if (this.destroyed) return;
     this.destroyed = true;
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
@@ -2559,11 +2760,51 @@ export class TurboRoadEngine {
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
     window.removeEventListener('blur', this.handleWindowBlur);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDown);
     window.removeEventListener('pointermove', this.handlePointerMove);
     window.removeEventListener('pointerup', this.handlePointerUp);
     this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
-    this.worldRig?.disposables.forEach((d) => d.dispose());
+
+    if (this.playerCar) {
+      this.scene.remove(this.playerCar.root);
+      this.disposeObjectTree(this.playerCar.root);
+      this.playerCar = null;
+    }
+    for (const traffic of this.trafficPool) this.disposeObjectTree(traffic.rig.root);
+    for (const coin of this.coinPool) this.disposeObjectTree(coin.mesh);
+    for (const nitro of this.nitroPool) this.disposeObjectTree(nitro.group);
+    for (const pad of this.boostPadPool) this.disposeObjectTree(pad.mesh);
+    for (const obstacle of this.obstaclePool) this.disposeObjectTree(obstacle.group);
+    for (const particle of this.particlePool) {
+      particle.mesh.geometry.dispose();
+      (particle.mesh.material as THREE.Material).dispose();
+    }
+    this.trafficPool = [];
+    this.coinPool = [];
+    this.nitroPool = [];
+    this.boostPadPool = [];
+    this.obstaclePool = [];
+    this.particlePool = [];
+
+    if (this.worldRig) {
+      this.scene.remove(this.worldRig.group);
+      this.worldRig.disposables.forEach((d) => d.dispose());
+      this.worldRig = null;
+    }
+
+    this.disposeObjectTree(this.garageTurntable);
+    this.sunLight.shadow.dispose();
+    this.sunLight.dispose();
+    this.rimLight.dispose();
+    for (const softbox of this.garageSoftboxes) softbox.dispose();
+    this.garageSoftboxes = [];
+
+    this.envRenderTarget?.dispose();
+    this.envRenderTarget = null;
+    this.scene.environment = null;
+    this.scene.background = null;
+
     this.shadowTexture.dispose();
     this.tireTreadTexture.dispose();
     this.carbonTexture.dispose();

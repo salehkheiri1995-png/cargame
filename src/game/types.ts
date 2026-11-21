@@ -23,7 +23,7 @@ export type EnvironmentId =
   | 'nightCity'
   | 'sunsetCanyon';
 
-export type GraphicsQuality = 'low' | 'medium' | 'high';
+export type GraphicsQuality = 'low' | 'medium' | 'high' | 'auto';
 
 export type ControlScheme = 'buttons' | 'wheel' | 'drag';
 
@@ -231,8 +231,36 @@ export interface GameSettings {
   musicVolume: number;         // 0 - 1
   sfxVolume: number;           // 0 - 1
   steeringSensitivity: number; // 0.5 - 1.5
+  steeringDeadZone: number;    // 0 - 0.2
   graphicsQuality: GraphicsQuality;
   controlScheme: ControlScheme;
+  shakeIntensity: number;      // 0 - 1.5
+  chromaticAberration: boolean;
+  filmGrain: boolean;
+  speedLines: boolean;
+  bloomEnabled: boolean;
+  reduceMotion: boolean;
+  leftHanded: boolean;
+  controlScale: number;        // 0.8 - 1.25
+  controlOpacity: number;      // 0.4 - 1
+  tutorialSeen: boolean;
+}
+
+export interface DebugStats {
+  fps: number;
+  frameTimeMs: number;
+  frameTimeJitterMs: number;
+  drawCalls: number;
+  triangles: number;
+  geometries: number;
+  textures: number;
+  pixelRatio: number;
+  qualitySetting: GraphicsQuality;
+  effectiveQuality: 'low' | 'medium' | 'high';
+  autoRenderScale: number;
+  activeTraffic: number;
+  activeCoins: number;
+  activeParticles: number;
 }
 
 export interface DailyMissionProgress {
@@ -261,6 +289,11 @@ export interface SaveData {
   starterPackOwned: boolean;
   premiumCarOwned: boolean;
   processedTransactions: string[];
+  /** Bounded ledger of race IDs whose base result has already been banked. */
+  settledRaceIds: string[];
+  /** Bounded ledger of race IDs whose one-time "double coins" bonus was granted. */
+  doubleBonusRaceIds: string[];
+  lastSavedAt: number;
   settings: GameSettings;
   checksum: string;
 }
@@ -304,6 +337,8 @@ export interface RaceHudSnapshot {
   rivalAheadDist: number | null;
   rivalsDefeated: number;
   cameraMode: 'chase' | 'low' | 'hood' | 'cockpit';
+  /** Seconds remaining on the pre-race countdown; 0 means racing is active. */
+  countdown: number;
 }
 
 export interface RaceResult {

@@ -11,26 +11,47 @@ import { MainMenuOverlay } from './components/MainMenuOverlay';
 import { LevelMapOverlay, ModeSelectOverlay } from './components/ModeAndLevelsOverlay';
 import { RaceHudOverlay } from './components/RaceHudOverlay';
 import { getLevelById } from './game/data/levels';
-import {
-  computeEffectiveStats,
-  getDefaultUpgrades,
-  getUpgradeCost,
-  MAX_UPGRADE_LEVEL,
-  VEHICLE_MAP,
-} from './game/data/vehicles';
+import { computeEffectiveStats, VEHICLE_MAP } from './game/data/vehicles';
 import { t } from './game/i18n';
 import { audioEngine } from './game/services/audioEngine';
-import { monetizationService, type RewardedPlacement } from './game/services/monetization';
 import {
-  applyRaceResultToSave,
+  applyPurchaseOutcome,
+  buyCar,
+  equipCar,
+  grantCoins,
+  restoreEntitlements,
+  setCarPaint,
+  upgradeStat,
+} from './game/services/economyOps';
+import { monetizationService, type RewardedPlacement } from './game/services/monetization';
+import type { AdSession } from './game/services/providers';
+import {
+  canOfferDouble,
+  createRaceSession,
+  declineRevive,
+  markDoubleGranted,
+  recordRaceEnd,
+  reviveSession,
+  settleSession,
+  startNewRace,
+  type RaceSession,
+} from './game/services/raceSession';
+import {
+  claimDailyReward,
+  claimMissionReward,
+  clearPendingRace,
   createDefaultSave,
-  getTodayKey,
-  loadSaveData,
+  grantDoubleCoinsBonus,
+  loadPendingRace,
+  loadSaveDataWithStatus,
+  normalizeSettings,
+  persistPendingRace,
   persistSaveData,
 } from './game/services/saveSystem';
 import { TurboRoadEngine } from './game/three/gameEngine';
 import type {
   ActiveRaceConfig,
+  DebugStats,
   EnvironmentId,
   GameSettings,
   LevelConfig,
@@ -42,6 +63,10 @@ import type {
   VehicleConfig,
   VehicleUpgradeLevels,
 } from './game/types';
+
+const IS_DEV = Boolean(
+  (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
+);
 
 const INITIAL_HUD: RaceHudSnapshot = {
   speedKmh: 0,
@@ -71,19 +96,31 @@ const INITIAL_HUD: RaceHudSnapshot = {
   rivalAheadDist: null,
   rivalsDefeated: 0,
   cameraMode: 'chase',
+  countdown: 0,
 };
+
+const FREE_COINS_REWARD = 100;
 
 interface PendingAd {
   kind: 'rewarded' | 'interstitial';
-  nonce?: string;
+  session: AdSession | null;
   onReward: () => void;
 }
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<TurboRoadEngine | null>(null);
+  const initialLoadRef = useRef<ReturnType<typeof loadSaveDataWithStatus> | null>(null);
+  const pendingAdRef = useRef<PendingAd | null>(null);
+  const adBusyRef = useRef(false);
+  const purchaseBusyRef = useRef(false);
+  const sessionRef = useRef<RaceSession | null>(null);
 
-  const [save, setSave] = useState<SaveData>(() => loadSaveData());
+  const [save, setSave] = useState<SaveData>(() => {
+    const loaded = loadSaveDataWithStatus();
+    initialLoadRef.current = loaded;
+    return loaded.save;
+  });
   const saveRef = useRef<SaveData>(save);
   saveRef.current = save;
 
@@ -98,9 +135,20 @@ export default function App() {
   const [coinsDoubled, setCoinsDoubled] = useState(false);
   const [muted, setMuted] = useState(false);
   const [shopStatus, setShopStatus] = useState<string | null>(null);
+  const [purchasePending, setPurchasePending] = useState(false);
+  const [tutorialPending, setTutorialPending] = useState(false);
   const [pendingAd, setPendingAd] = useState<PendingAd | null>(null);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [debugStats, setDebugStats] = useState<DebugStats | null>(null);
 
   const lang = save.settings.language;
+
+  /** Single source of truth for the latest save; every economy op reads this. */
+  const commitSave = useCallback((next: SaveData) => {
+    saveRef.current = next;
+    setSave(next);
+  }, []);
 
   // Sync HTML lang & dir (RTL Persian / LTR English)
   useEffect(() => {
@@ -129,34 +177,75 @@ export default function App() {
     }
   }, [screen, paused, raceResult, pendingAd]);
 
-  const updateSave = useCallback((updater: (prev: SaveData) => SaveData) => {
-    setSave((prev) => {
-      const next = persistSaveData(updater(prev));
-      saveRef.current = next;
-      return next;
-    });
+  // Persist after every committed save, but never as a side effect inside a
+  // React state updater. Storage failures are surfaced instead of swallowed.
+  useEffect(() => {
+    const result = persistSaveData(save);
+    setStorageError(
+      result.ok
+        ? null
+        : t(
+            save.settings.language,
+            result.error === 'quota' ? 'saveErrorQuota' : 'saveErrorGeneric'
+          )
+    );
+  }, [save]);
+
+  useEffect(() => {
+    if (initialLoadRef.current?.recovered) {
+      setSaveNotice(t(saveRef.current.settings.language, 'saveRecovered'));
+    }
   }, []);
+
+  // Recover a crash that happened right before a reload. The raceId ledger in
+  // the save still guarantees the result cannot be banked twice.
+  useEffect(() => {
+    const pending = loadPendingRace();
+    if (!pending) return;
+    let session = createRaceSession(pending.raceId);
+    session = recordRaceEnd(session, pending.result);
+    session = declineRevive(session);
+    const settlement = settleSession(session, saveRef.current);
+    if (settlement.applied) commitSave(settlement.save);
+    clearPendingRace();
+  }, [commitSave]);
 
   // Stable race end handler referenced by WebGL engine
   const handleRaceEndRef = useRef<(result: RaceResult) => void>(() => {});
   handleRaceEndRef.current = (rawResult: RaceResult) => {
-    const currentSave = saveRef.current;
-    const isNewBestScore =
-      rawResult.mode === 'endless' && rawResult.score > currentSave.endlessBestScore;
-    const isNewBestDistance =
-      rawResult.mode === 'endless' && rawResult.distanceM > currentSave.endlessBestDistance;
+    const session = sessionRef.current;
+    if (!session || session.phase === 'settled' || session.phase === 'finished') return;
 
+    const currentSave = saveRef.current;
     const enriched: RaceResult = {
       ...rawResult,
-      isNewBestScore,
-      isNewBestDistance,
+      isNewBestScore:
+        rawResult.mode === 'endless' && rawResult.score > currentSave.endlessBestScore,
+      isNewBestDistance:
+        rawResult.mode === 'endless' && rawResult.distanceM > currentSave.endlessBestDistance,
     };
 
-    // Persist rewards & daily mission progress immediately (revive can continue same run cleanly)
-    if (!enriched.canRevive || enriched.won) {
-      updateSave((prev) => applyRaceResultToSave(prev, enriched));
+    const recorded = recordRaceEnd(session, enriched);
+    sessionRef.current = recorded;
+    setCoinsDoubled(recorded.doubleGranted);
+
+    if (recorded.phase === 'awaiting-revive') {
+      // Do not bank yet: the player may still revive the same race.
+      setRaceResult(enriched);
+      persistPendingRace({
+        raceId: recorded.raceId,
+        result: enriched,
+        savedAt: Date.now(),
+      });
+      return;
     }
-    setCoinsDoubled(false);
+
+    if (recorded.phase !== 'finished') return;
+
+    const settlement = settleSession(recorded, currentSave);
+    sessionRef.current = settlement.session;
+    if (settlement.applied) commitSave(settlement.save);
+    clearPendingRace();
     setRaceResult(enriched);
   };
 
@@ -168,16 +257,15 @@ export default function App() {
     const engine = new TurboRoadEngine(container, {
       onHudUpdate: (snapshot) => setHud(snapshot),
       onRaceEnd: (res) => handleRaceEndRef.current(res),
+      onDebugStats: IS_DEV ? (stats) => setDebugStats(stats) : undefined,
     });
 
     const initialSave = saveRef.current;
     engine.setLanguage(initialSave.settings.language);
     engine.setGraphicsQuality(initialSave.settings.graphicsQuality);
+    engine.applyGameSettings(initialSave.settings);
     const carCfg = VEHICLE_MAP[initialSave.selectedCarId] ?? VEHICLE_MAP.spark_hatch;
-    engine.setShowcaseCar(
-      carCfg.id,
-      initialSave.carColors[carCfg.id] ?? carCfg.defaultColor
-    );
+    engine.setShowcaseCar(carCfg.id, initialSave.carColors[carCfg.id] ?? carCfg.defaultColor);
 
     engineRef.current = engine;
     return () => {
@@ -220,32 +308,78 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [screen, raceResult]);
 
-  // Helper to commit un-saved result when player declines revive and exits/restarts
+  /** Banks a crash result only when the revive offer is finally declined. */
   const commitPendingCrashIfNeeded = useCallback(() => {
-    if (raceResult && raceResult.canRevive && !raceResult.won) {
-      updateSave((prev) => applyRaceResultToSave(prev, raceResult));
-    }
-  }, [raceResult, updateSave]);
+    const session = sessionRef.current;
+    if (!session || session.phase !== 'awaiting-revive') return;
+    const declined = declineRevive(session);
+    const settlement = settleSession(declined, saveRef.current);
+    sessionRef.current = settlement.session;
+    if (settlement.applied) commitSave(settlement.save);
+    clearPendingRace();
+  }, [commitSave]);
 
-  const maybeShowInterstitialThen = useCallback(
-    (nextAction: () => void) => {
-      if (monetizationService.shouldShowInterstitial(saveRef.current.removeAdsOwned)) {
-        setPendingAd({
-          kind: 'interstitial',
-          onReward: nextAction,
-        });
-      } else {
-        nextAction();
+  const finishPendingAd = useCallback((completed: boolean) => {
+    const ad = pendingAdRef.current;
+    if (!ad) return;
+    pendingAdRef.current = null;
+    adBusyRef.current = false;
+    setPendingAd(null);
+
+    if (!completed) {
+      ad.session?.cancel();
+      return;
+    }
+    if (ad.kind === 'rewarded') {
+      if (!ad.session) return;
+      const outcome = ad.session.complete();
+      if (outcome.status !== 'completed') return;
+    }
+    audioEngine.playRewardFanfare();
+    ad.onReward();
+  }, []);
+
+  const requestRewardedAd = useCallback(
+    (placement: RewardedPlacement, grantCallback: () => void) => {
+      if (adBusyRef.current) return;
+      const session = monetizationService.beginRewarded(placement);
+      if (!session) {
+        setShopStatus(t(saveRef.current.settings.language, 'adsUnavailable'));
+        return;
       }
+      adBusyRef.current = true;
+      const ad: PendingAd = { kind: 'rewarded', session, onReward: grantCallback };
+      pendingAdRef.current = ad;
+      setPendingAd(ad);
     },
     []
   );
+
+  const maybeShowInterstitialThen = useCallback((nextAction: () => void) => {
+    if (adBusyRef.current) {
+      nextAction();
+      return;
+    }
+    if (monetizationService.shouldShowInterstitial(saveRef.current.removeAdsOwned)) {
+      adBusyRef.current = true;
+      const ad: PendingAd = { kind: 'interstitial', session: null, onReward: nextAction };
+      pendingAdRef.current = ad;
+      setPendingAd(ad);
+    } else {
+      nextAction();
+    }
+  }, []);
 
   const launchRace = useCallback(
     (mode: 'endless' | 'level', env: EnvironmentId, levelConfig?: LevelConfig) => {
       audioEngine.unlock();
       audioEngine.playButtonClick();
+      // A fresh race always gets a fresh ID; the previous one stays in the ledger.
+      sessionRef.current = startNewRace(sessionRef.current);
+      clearPendingRace();
+
       const s = saveRef.current;
+      const needsTutorial = !s.settings.tutorialSeen;
       const car = VEHICLE_MAP[s.selectedCarId] ?? VEHICLE_MAP.spark_hatch;
       const stats = computeEffectiveStats(car, s.carUpgrades[car.id]);
       const cfg: ActiveRaceConfig = {
@@ -262,27 +396,13 @@ export default function App() {
       setActiveRace(cfg);
       setRaceResult(null);
       setCoinsDoubled(false);
-      setPaused(false);
+      setPaused(needsTutorial);
+      setTutorialPending(needsTutorial);
       setDoorsOpen(false);
       setScreen('playing');
       engineRef.current?.startRace(cfg);
-    },
-    []
-  );
-
-  const requestRewardedAd = useCallback(
-    (placement: RewardedPlacement, grantCallback: () => void) => {
-      const nonce = monetizationService.createRewardNonce(placement);
-      setPendingAd({
-        kind: 'rewarded',
-        nonce,
-        onReward: () => {
-          if (monetizationService.consumeRewardNonce(nonce)) {
-            audioEngine.playRewardFanfare();
-            grantCallback();
-          }
-        },
-      });
+      // The first-run guide pauses the countdown until it is dismissed.
+      if (needsTutorial) engineRef.current?.setPaused(true);
     },
     []
   );
@@ -305,134 +425,145 @@ export default function App() {
   };
 
   const handleBuyCar = (car: VehicleConfig) => {
-    if (save.coins < car.price || save.ownedCars.includes(car.id)) return;
+    const result = buyCar(saveRef.current, car.id);
+    if (!result.applied) return;
     audioEngine.playCarUnlock();
-    updateSave((prev) => ({
-      ...prev,
-      coins: prev.coins - car.price,
-      ownedCars: [...prev.ownedCars, car.id],
-      selectedCarId: car.id,
-      carColors: { ...prev.carColors, [car.id]: prev.carColors[car.id] ?? car.defaultColor },
-      carUpgrades: { ...prev.carUpgrades, [car.id]: prev.carUpgrades[car.id] ?? getDefaultUpgrades() },
-    }));
+    commitSave(result.save);
   };
 
   const handleEquipCar = (carId: string) => {
-    if (!save.ownedCars.includes(carId)) return;
+    const result = equipCar(saveRef.current, carId);
+    if (!result.applied) return;
     audioEngine.playButtonClick();
-    updateSave((prev) => ({ ...prev, selectedCarId: carId }));
+    commitSave(result.save);
   };
 
   const handleChangePaint = (carId: string, hex: string) => {
+    const result = setCarPaint(saveRef.current, carId, hex);
+    if (!result.applied) return;
     audioEngine.playButtonClick();
-    updateSave((prev) => ({
-      ...prev,
-      carColors: { ...prev.carColors, [carId]: hex },
-    }));
+    commitSave(result.save);
   };
 
   const handleUpgradeStat = (car: VehicleConfig, stat: keyof VehicleUpgradeLevels) => {
-    if (!save.ownedCars.includes(car.id)) return;
-    const currentUpgrades = save.carUpgrades[car.id] ?? getDefaultUpgrades();
-    const curLevel = currentUpgrades[stat];
-    if (curLevel >= MAX_UPGRADE_LEVEL) return;
-    const cost = getUpgradeCost(car, curLevel);
-    if (save.coins < cost) return;
-
+    const result = upgradeStat(saveRef.current, car.id, stat);
+    if (!result.applied) return;
     audioEngine.playRewardFanfare();
-    updateSave((prev) => {
-      const prevU = prev.carUpgrades[car.id] ?? getDefaultUpgrades();
-      return {
-        ...prev,
-        coins: prev.coins - cost,
-        carUpgrades: {
-          ...prev.carUpgrades,
-          [car.id]: { ...prevU, [stat]: curLevel + 1 },
-        },
-      };
-    });
+    commitSave(result.save);
   };
 
-  const handleStartPurchase = (product: ShopProduct) => {
-    const txId = `bazaar_sandbox_${product.sku}_${Date.now()}`;
-    const { nextSave, applied } = monetizationService.applyVerifiedPurchase(
-      saveRef.current,
-      product.sku,
-      txId
-    );
-    if (applied) {
-      audioEngine.playCarUnlock();
-      setSave(persistSaveData(nextSave));
-      saveRef.current = nextSave;
-      setShopStatus(t(lang, 'purchaseSuccess'));
+  const handleStartPurchase = async (product: ShopProduct) => {
+    if (purchaseBusyRef.current) return;
+    purchaseBusyRef.current = true;
+    setPurchasePending(true);
+    setShopStatus(null);
+    try {
+      const outcome = await monetizationService.purchase(product.sku);
+      const currentLang = saveRef.current.settings.language;
+      const result = applyPurchaseOutcome(saveRef.current, product.sku, outcome);
+      if (result.status === 'success') {
+        if (result.applied) {
+          audioEngine.playCarUnlock();
+          commitSave(result.save);
+          setShopStatus(t(currentLang, 'purchaseSuccess'));
+        } else {
+          setShopStatus(t(currentLang, 'purchaseAlreadyApplied'));
+        }
+      } else if (result.status === 'cancelled') {
+        setShopStatus(t(currentLang, 'purchaseCancelled'));
+      } else {
+        setShopStatus(outcome.error ?? t(currentLang, 'purchaseFailed'));
+      }
+    } finally {
+      purchaseBusyRef.current = false;
+      setPurchasePending(false);
     }
   };
 
-  const handleRestorePurchases = () => {
+  const handleRestorePurchases = async () => {
     audioEngine.playButtonClick();
-    updateSave((prev) => monetizationService.restorePermanentPurchases(prev));
-    setShopStatus(t(lang, 'restoreDone'));
-  };
-
-  const handleClaimMission = (missionId: string, rewardCoins: number) => {
-    if (save.dailyMissions.claimed[missionId]) return;
-    audioEngine.playRewardFanfare();
-    updateSave((prev) => ({
-      ...prev,
-      coins: prev.coins + rewardCoins,
-      dailyMissions: {
-        ...prev.dailyMissions,
-        claimed: { ...prev.dailyMissions.claimed, [missionId]: true },
-      },
-    }));
-  };
-
-  const handleClaimDailyReward = (coins: number, doubleViaAd: boolean) => {
-    const grant = (amount: number) => {
-      updateSave((prev) => ({
-        ...prev,
-        coins: prev.coins + amount,
-        dailyRewardStreak: (prev.dailyRewardStreak % 7) + 1,
-        lastDailyRewardDate: getTodayKey(),
-      }));
-    };
-
-    if (doubleViaAd) {
-      requestRewardedAd('daily_reward_2x', () => grant(coins * 2));
+    const outcome = await monetizationService.restore();
+    const currentLang = saveRef.current.settings.language;
+    if (outcome.status === 'success') {
+      const result = restoreEntitlements(saveRef.current, outcome.entitlements);
+      commitSave(result.save);
+      setShopStatus(t(currentLang, 'restoreDone'));
     } else {
+      setShopStatus(outcome.error ?? t(currentLang, 'restoreFailed'));
+    }
+  };
+
+  const handleClaimMission = (missionId: string) => {
+    const result = claimMissionReward(saveRef.current, missionId);
+    if (!result.applied) return;
+    audioEngine.playRewardFanfare();
+    commitSave(result.save);
+  };
+
+  const handleClaimDailyReward = (doubleViaAd: boolean) => {
+    const attempt = (double: boolean) => {
+      const result = claimDailyReward(saveRef.current, { double });
+      if (!result.applied) return;
       audioEngine.playRewardFanfare();
-      grant(coins);
+      commitSave(result.save);
+    };
+    if (doubleViaAd) {
+      requestRewardedAd('daily_reward_2x', () => attempt(true));
+    } else {
+      attempt(false);
     }
   };
 
   const handleUpdateSettings = (patch: Partial<GameSettings>) => {
     audioEngine.playButtonClick();
-    updateSave((prev) => ({
-      ...prev,
-      settings: { ...prev.settings, ...patch },
-    }));
+    const nextSettings = normalizeSettings({ ...saveRef.current.settings, ...patch });
+    commitSave({ ...saveRef.current, settings: nextSettings });
+    engineRef.current?.applyGameSettings(nextSettings);
     if (patch.graphicsQuality) {
       engineRef.current?.setGraphicsQuality(patch.graphicsQuality);
     }
   };
 
   const handleResetSave = () => {
-    const fresh = persistSaveData(createDefaultSave());
-    setSave(fresh);
-    saveRef.current = fresh;
+    const fresh = createDefaultSave();
+    commitSave(fresh);
+    sessionRef.current = null;
+    clearPendingRace();
     setViewingCarId(fresh.selectedCarId);
+    setRaceResult(null);
+    setCoinsDoubled(false);
     audioEngine.playButtonClick();
+    engineRef.current?.applyGameSettings(fresh.settings);
+    engineRef.current?.setGraphicsQuality(fresh.settings.graphicsQuality);
   };
 
   const showBanner = monetizationService.shouldShowBanner(
     save.removeAdsOwned,
     screen === 'playing'
   );
+  const notice = saveNotice ?? storageError;
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-slate-950">
       {/* Isolated Full-Viewport 3D WebGL Canvas Container */}
       <div ref={canvasMountRef} className="fixed inset-0 z-0" />
+
+      {/* Unobtrusive save/storage notice (never blocks the game) */}
+      {notice && (
+        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[60] max-w-[92vw] px-4 py-2 rounded-xl bg-amber-500/95 text-slate-950 text-xs font-bold shadow-lg flex items-center gap-3">
+          <span className="leading-snug">{notice}</span>
+          <button
+            onClick={() => {
+              setSaveNotice(null);
+              setStorageError(null);
+            }}
+            className="shrink-0 px-2 py-0.5 rounded-md bg-slate-950/20 hover:bg-slate-950/30 cursor-pointer"
+            aria-label={t(lang, 'close')}
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Splash & Main Menu */}
       {(screen === 'splash' || screen === 'menu') && (
@@ -474,7 +605,7 @@ export default function App() {
         />
       )}
 
-      {/* 30-Level Map */}
+      {/* 45-Level Map */}
       {screen === 'levels' && (
         <LevelMapOverlay
           lang={lang}
@@ -521,13 +652,19 @@ export default function App() {
           lang={lang}
           raceConfig={activeRace}
           hud={hud}
-          controlScheme={save.settings.controlScheme}
-          onChangeControlScheme={(scheme) =>
-            handleUpdateSettings({ controlScheme: scheme })
-          }
+          settings={save.settings}
           paused={paused}
           result={raceResult}
           coinsDoubled={coinsDoubled}
+          showTutorial={tutorialPending}
+          onDismissTutorial={() => {
+            setTutorialPending(false);
+            setPaused(false);
+            engineRef.current?.setPaused(false);
+            if (!saveRef.current.settings.tutorialSeen) {
+              handleUpdateSettings({ tutorialSeen: true });
+            }
+          }}
           onTogglePause={() => {
             audioEngine.playButtonClick();
             setPaused((p) => {
@@ -572,21 +709,38 @@ export default function App() {
             maybeShowInterstitialThen(() => launchRace('level', nextLvl.environment, nextLvl));
           }}
           onReviveAd={() => {
+            const session = sessionRef.current;
+            if (!session || session.phase !== 'awaiting-revive') return;
             requestRewardedAd('revive_crash', () => {
+              const current = sessionRef.current;
+              if (!current || current.phase !== 'awaiting-revive') return;
+              sessionRef.current = reviveSession(current);
+              clearPendingRace();
               setRaceResult(null);
+              setCoinsDoubled(false);
               engineRef.current?.reviveFromCrash();
             });
           }}
           onDoubleCoinsAd={() => {
-            if (!raceResult || coinsDoubled) return;
-            const bonusCoins = raceResult.coinsCollected;
+            const session = sessionRef.current;
+            if (!session || !canOfferDouble(session)) return;
             requestRewardedAd('double_coins', () => {
+              const current = sessionRef.current;
+              if (!current || !canOfferDouble(current) || !current.result) return;
+              const result = grantDoubleCoinsBonus(
+                saveRef.current,
+                current.raceId,
+                current.result
+              );
+              if (!result.applied) return;
+              commitSave(result.save);
+              sessionRef.current = markDoubleGranted(current);
               setCoinsDoubled(true);
-              updateSave((prev) => ({ ...prev, coins: prev.coins + bonusCoins }));
             });
           }}
           onTouchControl={(ctrl, pressed) => engineRef.current?.setTouchControl(ctrl, pressed)}
           onTouchSteerAxis={(axis) => engineRef.current?.setTouchSteerAxis(axis)}
+          onChangeControlScheme={(scheme) => handleUpdateSettings({ controlScheme: scheme })}
         />
       )}
 
@@ -596,11 +750,13 @@ export default function App() {
           lang={lang}
           save={save}
           statusMessage={shopStatus}
+          purchasePending={purchasePending}
           onStartPurchase={handleStartPurchase}
           onWatchFreeCoinsAd={() =>
             requestRewardedAd('free_coins_shop', () => {
-              updateSave((prev) => ({ ...prev, coins: prev.coins + 100 }));
-              setShopStatus(t(lang, 'adComplete'));
+              const result = grantCoins(saveRef.current, FREE_COINS_REWARD);
+              if (result.applied) commitSave(result.save);
+              setShopStatus(t(saveRef.current.settings.language, 'adComplete'));
             })
           }
           onRestorePurchases={handleRestorePurchases}
@@ -639,17 +795,37 @@ export default function App() {
         />
       )}
 
+      {/* Dev-only performance overlay (tree-shaken from production callbacks) */}
+      {IS_DEV && debugStats && (
+        <div className="fixed bottom-1 left-1 z-[70] px-2 py-1.5 rounded-lg bg-slate-950/85 border border-white/15 text-[10px] leading-tight font-mono text-slate-300 pointer-events-none">
+          <div className="text-emerald-300 font-bold">{t(lang, 'debugStatsTitle')}</div>
+          <div>
+            {t(lang, 'fpsLabel')}: {debugStats.fps} · {t(lang, 'frameTimeLabel')}:{' '}
+            {debugStats.frameTimeMs}ms
+          </div>
+          <div>
+            {t(lang, 'drawCallsLabel')}: {debugStats.drawCalls} · {t(lang, 'trianglesLabel')}:{' '}
+            {debugStats.triangles}
+          </div>
+          <div>
+            {t(lang, 'geometriesLabel')}: {debugStats.geometries} · {t(lang, 'texturesLabel')}:{' '}
+            {debugStats.textures}
+          </div>
+          <div>
+            {t(lang, 'pixelRatioLabel')}: {debugStats.pixelRatio} ·{' '}
+            {t(lang, 'effectiveQualityLabel')}: {debugStats.effectiveQuality} ·{' '}
+            {t(lang, 'autoScaleLabel')}: {debugStats.autoRenderScale}
+          </div>
+        </div>
+      )}
+
       {/* Ad Player Modal (Rewarded Video / Interstitial — never triggers during active driving) */}
       {pendingAd && (
         <AdPlayerOverlay
           lang={lang}
           kind={pendingAd.kind}
-          onComplete={() => {
-            const cb = pendingAd.onReward;
-            setPendingAd(null);
-            cb();
-          }}
-          onCancel={() => setPendingAd(null)}
+          onComplete={() => finishPendingAd(true)}
+          onCancel={() => finishPendingAd(false)}
         />
       )}
     </div>
