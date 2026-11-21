@@ -244,6 +244,10 @@ export interface GameSettings {
   controlScale: number;        // 0.8 - 1.25
   controlOpacity: number;      // 0.4 - 1
   tutorialSeen: boolean;
+  /** Native haptics (Capacitor Haptics) with a navigator.vibrate fallback. */
+  hapticsEnabled: boolean;
+  /** Caps the render loop at ~30 FPS to reduce heat/battery use. */
+  batterySaver: boolean;
 }
 
 export interface DebugStats {
@@ -293,6 +297,11 @@ export interface SaveData {
   settledRaceIds: string[];
   /** Bounded ledger of race IDs whose one-time "double coins" bonus was granted. */
   doubleBonusRaceIds: string[];
+  /** Daily free-coins-ad counter (schema v3 extension, migrated without a reset). */
+  freeCoinAdDay: string;
+  freeCoinAdCount: number;
+  /** Epoch ms of the last free-coins ad reward; used for the cooldown. */
+  freeCoinAdLastAt: number;
   lastSavedAt: number;
   settings: GameSettings;
   checksum: string;

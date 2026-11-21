@@ -13,9 +13,12 @@ import {
   upgradeStat,
 } from './economyOps';
 import {
+  NativeAdProvider,
+  NativeBillingProvider,
   UnavailableBillingProvider,
   SandboxAdProvider,
   UnavailableAdProvider,
+  resolveMonetizationMode,
 } from './providers';
 import { createDefaultSave, MAX_COINS, STARTING_CAR_ID } from './saveSystem';
 
@@ -216,5 +219,65 @@ describe('monetization provider contracts', () => {
     const provider = new UnavailableAdProvider();
     assert.equal(provider.isRewardedAvailable('revive_crash'), false);
     assert.equal(provider.beginRewarded('revive_crash'), null);
+  });
+
+  it('defaults an unset mode to production in a release build', () => {
+    assert.equal(resolveMonetizationMode(undefined, true), 'production');
+    assert.equal(resolveMonetizationMode('', true), 'production');
+    assert.equal(resolveMonetizationMode('sandbox', true), 'sandbox');
+    assert.equal(resolveMonetizationMode('production', true), 'production');
+    assert.equal(resolveMonetizationMode(undefined, false), 'sandbox');
+  });
+
+  it('requires a native transaction id before a purchase is granted', async () => {
+    const provider = new NativeBillingProvider({
+      purchase: async (sku) => ({
+        status: 'success',
+        sku,
+        // A success without proof must never become a free entitlement.
+      }),
+      restore: async () => ({ status: 'success', entitlements: [] }),
+      showRewarded: async () => ({ status: 'completed' }),
+    });
+    const outcome = await provider.purchase('coins_500');
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.transactionId, undefined);
+    assert.equal(outcome.sandbox, false);
+  });
+
+  it('maps a verified native purchase and restore through unchanged', async () => {
+    const provider = new NativeBillingProvider({
+      purchase: async (sku) => ({
+        status: 'success',
+        sku,
+        transactionId: 'tx-123',
+        verification: 'server',
+      }),
+      restore: async () => ({
+        status: 'success',
+        entitlements: [{ sku: 'remove_ads', transactionId: 'tx-9' }],
+      }),
+      showRewarded: async () => ({ status: 'completed' }),
+    });
+    const outcome = await provider.purchase('coins_500');
+    assert.equal(outcome.status, 'success');
+    assert.equal(outcome.transactionId, 'tx-123');
+
+    const restore = await provider.restore();
+    assert.equal(restore.status, 'success');
+    assert.deepEqual(restore.entitlements, [{ sku: 'remove_ads', transactionId: 'tx-9' }]);
+  });
+
+  it('does not reward a native ad without a reward token', async () => {
+    const provider = new NativeAdProvider({
+      purchase: async () => ({ status: 'unavailable' }),
+      restore: async () => ({ status: 'unavailable', entitlements: [] }),
+      showRewarded: async () => ({ status: 'completed' }),
+    });
+    assert.equal(provider.isRewardedAvailable('double_coins'), true);
+    assert.equal(provider.beginRewarded('double_coins'), null);
+    const outcome = await provider.showRewarded('double_coins');
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.rewardToken, undefined);
   });
 });

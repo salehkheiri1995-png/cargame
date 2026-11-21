@@ -402,13 +402,18 @@ export class CinematicPostProcessor {
   }
 
   public setQuality(quality: GraphicsQuality): void {
-    this.quality = quality;
+    // The engine resolves 'auto' to an effective tier before calling this, but
+    // a direct 'auto' call (e.g. from a test or a future caller) should never
+    // be treated as an unknown tier.
+    const resolved = quality === 'auto' ? 'medium' : quality;
+    const wasLow = this.quality === 'low';
+    this.quality = resolved;
     if (this.isSoftwareGl || !this.composer) return;
 
     const pixelRatio = this.renderer.getPixelRatio();
     if (this.renderTarget) {
       const targetSamples =
-        this.renderer.capabilities.isWebGL2 && quality === 'high' ? 4 : 0;
+        this.renderer.capabilities.isWebGL2 && resolved === 'high' ? 4 : 0;
       if (this.renderTarget.samples !== targetSamples) {
         this.renderTarget.samples = targetSamples;
         // EffectComposer keeps a second cloned target; reset() recreates BOTH
@@ -418,10 +423,14 @@ export class CinematicPostProcessor {
     }
 
     if (this.bloomPass) {
-      this.bloomPass.enabled = quality !== 'low' && this.options.bloomEnabled;
+      this.bloomPass.enabled = resolved !== 'low' && this.options.bloomEnabled;
     }
     if (this.colorGradePass) {
-      this.colorGradePass.enabled = quality !== 'low';
+      this.colorGradePass.enabled = resolved !== 'low';
+    }
+
+    if (wasLow) {
+      this.composer.setPixelRatio(pixelRatio);
     }
 
     this.composer.setPixelRatio(pixelRatio);

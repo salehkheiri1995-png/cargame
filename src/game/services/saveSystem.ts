@@ -28,6 +28,9 @@ export const CURRENT_VERSION = 3;
 
 export const STARTING_CAR_ID = 'spark_hatch';
 export const MAX_COINS = 10_000_000;
+/** Anti-farm limits for the optional free-coins rewarded ad in the shop. */
+export const FREE_COIN_AD_DAILY_CAP = 5;
+export const FREE_COIN_AD_COOLDOWN_MS = 60_000;
 const PROCESSED_TX_LIMIT = 100;
 const RACE_LEDGER_LIMIT = 60;
 
@@ -59,6 +62,28 @@ export interface PersistResult {
   save: SaveData;
   ok: boolean;
   error?: 'unavailable' | 'quota' | 'unknown';
+}
+
+/**
+ * Optional durable mirror (Capacitor Preferences on Android). localStorage
+ * stays the synchronous working copy that every existing caller expects, while
+ * the mirror receives the exact same payloads asynchronously. A mirror failure
+ * must never break the synchronous game loop.
+ */
+export type StorageMirror = (key: string, value: string | null) => void;
+let storageMirror: StorageMirror | null = null;
+
+export function setStorageMirror(mirror: StorageMirror | null): void {
+  storageMirror = mirror;
+}
+
+function mirrorWrite(key: string, value: string | null): void {
+  if (!storageMirror) return;
+  try {
+    storageMirror(key, value);
+  } catch {
+    // Mirrors are best-effort; the local result is still reported to the UI.
+  }
 }
 
 export interface PendingRaceRecord {
@@ -185,6 +210,8 @@ function defaultSettings(): GameSettings {
     controlScale: 1.0,
     controlOpacity: 0.85,
     tutorialSeen: false,
+    hapticsEnabled: true,
+    batterySaver: false,
   };
 }
 
@@ -225,6 +252,9 @@ export function createDefaultSave(now = new Date()): SaveData {
     processedTransactions: [],
     settledRaceIds: [],
     doubleBonusRaceIds: [],
+    freeCoinAdDay: getTodayKey(now),
+    freeCoinAdCount: 0,
+    freeCoinAdLastAt: 0,
     lastSavedAt: 0,
     settings: defaultSettings(),
   };
@@ -292,6 +322,8 @@ export function normalizeSettings(raw: unknown): GameSettings {
     controlScale: num(raw.controlScale, d.controlScale, 0.8, 1.25),
     controlOpacity: num(raw.controlOpacity, d.controlOpacity, 0.4, 1),
     tutorialSeen: bool(raw.tutorialSeen, d.tutorialSeen),
+    hapticsEnabled: bool(raw.hapticsEnabled, d.hapticsEnabled),
+    batterySaver: bool(raw.batterySaver, d.batterySaver),
   };
 }
 
@@ -376,6 +408,19 @@ export function validateAndNormalizeSave(raw: unknown, now = new Date()): SaveDa
     streak = 0;
   }
 
+  // Schema v3 extension: old v3 payloads have no free-ad counters. A new day
+  // (or a corrupt/missing day) starts at zero; a valid same-day payload keeps
+  // its counter, so an upgrade never resets the anti-farm budget.
+  const rawFreeDay = isValidDateKey(raw.freeCoinAdDay) ? raw.freeCoinAdDay : null;
+  const sameFreeDay = rawFreeDay === today;
+  const freeCoinAdCount = sameFreeDay
+    ? int(raw.freeCoinAdCount, 0, 0, FREE_COIN_AD_DAILY_CAP)
+    : 0;
+  const rawFreeLastAt = sameFreeDay
+    ? int(raw.freeCoinAdLastAt, 0, 0, Number.MAX_SAFE_INTEGER)
+    : 0;
+  const freeCoinAdLastAt = rawFreeLastAt > now.getTime() ? 0 : rawFreeLastAt;
+
   const base: Omit<SaveData, 'checksum'> = {
     version: CURRENT_VERSION,
     coins: int(raw.coins, d.coins, 0, MAX_COINS),
@@ -398,6 +443,9 @@ export function validateAndNormalizeSave(raw: unknown, now = new Date()): SaveDa
     processedTransactions: cleanIdList(raw.processedTransactions, PROCESSED_TX_LIMIT, 160),
     settledRaceIds: cleanIdList(raw.settledRaceIds, RACE_LEDGER_LIMIT),
     doubleBonusRaceIds: cleanIdList(raw.doubleBonusRaceIds, RACE_LEDGER_LIMIT),
+    freeCoinAdDay: today,
+    freeCoinAdCount,
+    freeCoinAdLastAt,
     lastSavedAt: int(raw.lastSavedAt, 0, 0, Number.MAX_SAFE_INTEGER),
     settings: normalizeSettings(raw.settings),
   };
@@ -420,6 +468,24 @@ function parseRaw(raw: string | null): { value: unknown; checksum?: string } | n
   }
 }
 
+/**
+ * A JSON object that merely parses is not necessarily a save. Without this
+ * gate an empty object `{}` would be accepted as the primary and silently
+ * replace a perfectly good backup with a fresh 500-coin profile.
+ *
+ * A usable payload must look like a save from v2 or newer: it needs a numeric
+ * version and at least one core economy field (coins or ownedCars). Missing
+ * optional fields are still repaired by `validateAndNormalizeSave`.
+ */
+export function isUsableSavePayload(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const versionOk = typeof value.version === 'number' && Number.isFinite(value.version) && value.version >= 2;
+  if (!versionOk) return false;
+  const hasCoins = typeof value.coins === 'number' && Number.isFinite(value.coins);
+  const hasCars = Array.isArray(value.ownedCars) && value.ownedCars.length > 0;
+  return hasCoins || hasCars;
+}
+
 export function loadSaveDataWithStatus(
   storage: StorageLike | null = getDefaultStorage(),
   now = new Date()
@@ -437,6 +503,7 @@ export function loadSaveDataWithStatus(
   for (const candidate of candidates) {
     const parsed = parseRaw(candidate.raw);
     if (!parsed) continue;
+    if (!isUsableSavePayload(parsed.value)) continue;
     const save = validateAndNormalizeSave(parsed.value, now);
     // Mismatch is surfaced for diagnostics only; normalization is the real gate.
     const { checksum: _checksum, ...withoutChecksum } = save;
@@ -488,26 +555,35 @@ export function persistSaveData(
     lastSavedAt,
   };
   const signed: SaveData = { ...signedBase, checksum: computeChecksum(signedBase) };
-  if (!storage) return { save: signed, ok: false, error: 'unavailable' };
+  const serialized = JSON.stringify(signed);
+  if (!storage) {
+    mirrorWrite(STORAGE_KEY, serialized);
+    return { save: signed, ok: false, error: 'unavailable' };
+  }
 
   try {
     const previous = safeGet(storage, STORAGE_KEY);
-    const serialized = JSON.stringify(signed);
     if (previous === serialized) return { save: signed, ok: true };
 
     if (previous) {
       try {
         // Backup is intentionally the *previous* valid snapshot.
         const previousParsed = parseRaw(previous);
-        if (previousParsed) storage.setItem(BACKUP_KEY, previous);
+        if (previousParsed) {
+          storage.setItem(BACKUP_KEY, previous);
+          mirrorWrite(BACKUP_KEY, previous);
+        }
       } catch {
         // Backup failure must not prevent the primary write.
       }
     }
 
     storage.setItem(STORAGE_KEY, serialized);
+    mirrorWrite(STORAGE_KEY, serialized);
     return { save: signed, ok: true };
   } catch (error) {
+    // Even when localStorage is full/unavailable, try the durable mirror.
+    mirrorWrite(STORAGE_KEY, serialized);
     const name = isRecord(error) && typeof error.name === 'string' ? error.name : '';
     const quota = /quota|exceeded/i.test(name) || /quota|exceeded/i.test(String(error));
     return { save: signed, ok: false, error: quota ? 'quota' : 'unknown' };
@@ -580,9 +656,11 @@ export function persistPendingRace(
   record: PendingRaceRecord,
   storage: StorageLike | null = getDefaultStorage()
 ): boolean {
+  const serialized = JSON.stringify(record);
+  mirrorWrite(PENDING_RACE_KEY, serialized);
   if (!storage) return false;
   try {
-    storage.setItem(PENDING_RACE_KEY, JSON.stringify(record));
+    storage.setItem(PENDING_RACE_KEY, serialized);
     return true;
   } catch {
     return false;
@@ -590,6 +668,7 @@ export function persistPendingRace(
 }
 
 export function clearPendingRace(storage: StorageLike | null = getDefaultStorage()): void {
+  mirrorWrite(PENDING_RACE_KEY, null);
   if (!storage) return;
   try {
     storage.removeItem(PENDING_RACE_KEY);

@@ -17,14 +17,20 @@ import { audioEngine } from './game/services/audioEngine';
 import {
   applyPurchaseOutcome,
   buyCar,
+  claimFreeCoinsAdReward,
   equipCar,
-  grantCoins,
   restoreEntitlements,
   setCarPaint,
   upgradeStat,
 } from './game/services/economyOps';
 import { monetizationService, type RewardedPlacement } from './game/services/monetization';
 import type { AdSession } from './game/services/providers';
+import { hapticNotification, setHapticsEnabled } from './game/services/haptics';
+import {
+  exitApp,
+  registerAppStateHandler,
+  registerBackHandler,
+} from './game/services/platform';
 import {
   canOfferDouble,
   createRaceSession,
@@ -32,8 +38,8 @@ import {
   markDoubleGranted,
   recordRaceEnd,
   reviveSession,
+  settleBeforeNewRace,
   settleSession,
-  startNewRace,
   type RaceSession,
 } from './game/services/raceSession';
 import {
@@ -51,6 +57,7 @@ import {
 import { TurboRoadEngine } from './game/three/gameEngine';
 import type {
   ActiveRaceConfig,
+  DebugStats,
   EnvironmentId,
   GameSettings,
   LevelConfig,
@@ -96,6 +103,11 @@ const INITIAL_HUD: RaceHudSnapshot = {
 
 const FREE_COINS_REWARD = 100;
 
+/** Debug overlay is only wired when explicitly requested (dev build or ?debug=1). */
+const DEBUG_ENABLED =
+  import.meta.env?.DEV === true
+  || (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('debug'));
+
 interface PendingAd {
   kind: 'rewarded' | 'interstitial';
   session: AdSession | null;
@@ -135,6 +147,8 @@ export default function App() {
   const [pendingAd, setPendingAd] = useState<PendingAd | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [exitConfirm, setExitConfirm] = useState(false);
+  const [debugStats, setDebugStats] = useState<DebugStats | null>(null);
 
   const lang = save.settings.language;
 
@@ -159,6 +173,11 @@ export default function App() {
       audioEngine.setVolumes(save.settings.musicVolume, save.settings.sfxVolume);
     }
   }, [muted, save.settings.musicVolume, save.settings.sfxVolume]);
+
+  // Sync haptics preference (native Haptics with a navigator.vibrate fallback).
+  useEffect(() => {
+    setHapticsEnabled(save.settings.hapticsEnabled);
+  }, [save.settings.hapticsEnabled]);
 
   // Sync background music mode
   useEffect(() => {
@@ -231,6 +250,7 @@ export default function App() {
         result: enriched,
         savedAt: Date.now(),
       });
+      void hapticNotification('warning');
       return;
     }
 
@@ -241,6 +261,7 @@ export default function App() {
     if (settlement.applied) commitSave(settlement.save);
     clearPendingRace();
     setRaceResult(enriched);
+    void hapticNotification(enriched.won ? 'success' : 'error');
   };
 
   // Mount Three.js Game Engine ONCE in isolated canvas container
@@ -251,6 +272,7 @@ export default function App() {
     const engine = new TurboRoadEngine(container, {
       onHudUpdate: (snapshot) => setHud(snapshot),
       onRaceEnd: (res) => handleRaceEndRef.current(res),
+      ...(DEBUG_ENABLED ? { onDebugStats: (stats) => setDebugStats(stats) } : {}),
     });
 
     const initialSave = saveRef.current;
@@ -319,15 +341,20 @@ export default function App() {
     adBusyRef.current = false;
     setPendingAd(null);
 
+    if (ad.kind === 'interstitial') {
+      // Interstitials carry no reward, but they do carry the next navigation.
+      // Closing early must still run it, otherwise the player is stranded on a
+      // dead result/pause screen (stage-4 bug).
+      ad.onReward();
+      return;
+    }
     if (!completed) {
       ad.session?.cancel();
       return;
     }
-    if (ad.kind === 'rewarded') {
-      if (!ad.session) return;
-      const outcome = ad.session.complete();
-      if (outcome.status !== 'completed') return;
-    }
+    if (!ad.session) return;
+    const outcome = ad.session.complete();
+    if (outcome.status !== 'completed') return;
     audioEngine.playRewardFanfare();
     ad.onReward();
   }, []);
@@ -335,6 +362,24 @@ export default function App() {
   const requestRewardedAd = useCallback(
     (placement: RewardedPlacement, grantCallback: () => void) => {
       if (adBusyRef.current) return;
+
+      // Native SDKs show their own fullscreen activity; no React overlay.
+      if (monetizationService.hasNativeAds) {
+        adBusyRef.current = true;
+        void (async () => {
+          const outcome = await monetizationService.showRewardedAsync(placement);
+          adBusyRef.current = false;
+          if (outcome.status === 'completed') {
+            audioEngine.playRewardFanfare();
+            void hapticNotification('success');
+            grantCallback();
+          } else if (outcome.status !== 'cancelled') {
+            setShopStatus(t(saveRef.current.settings.language, 'adNotCompleted'));
+          }
+        })();
+        return;
+      }
+
       const session = monetizationService.beginRewarded(placement);
       if (!session) {
         setShopStatus(t(saveRef.current.settings.language, 'adsUnavailable'));
@@ -353,22 +398,35 @@ export default function App() {
       nextAction();
       return;
     }
-    if (monetizationService.shouldShowInterstitial(saveRef.current.removeAdsOwned)) {
-      adBusyRef.current = true;
-      const ad: PendingAd = { kind: 'interstitial', session: null, onReward: nextAction };
-      pendingAdRef.current = ad;
-      setPendingAd(ad);
-    } else {
+    if (!monetizationService.shouldShowInterstitial(saveRef.current.removeAdsOwned)) {
       nextAction();
+      return;
     }
+    if (monetizationService.hasNativeAds) {
+      adBusyRef.current = true;
+      void (async () => {
+        await monetizationService.showInterstitialAsync();
+        adBusyRef.current = false;
+        nextAction();
+      })();
+      return;
+    }
+    adBusyRef.current = true;
+    const ad: PendingAd = { kind: 'interstitial', session: null, onReward: nextAction };
+    pendingAdRef.current = ad;
+    setPendingAd(ad);
   }, []);
 
   const launchRace = useCallback(
     (mode: 'endless' | 'level', env: EnvironmentId, levelConfig?: LevelConfig) => {
       audioEngine.unlock();
       audioEngine.playButtonClick();
-      // A fresh race always gets a fresh ID; the previous one stays in the ledger.
-      sessionRef.current = startNewRace(sessionRef.current);
+      // A crash still awaiting a revive must be banked before its session is
+      // replaced, or its reward would be lost (and later double-settled by a
+      // reload of the pending-race record).
+      const settled = settleBeforeNewRace(sessionRef.current, saveRef.current);
+      sessionRef.current = settled.session;
+      if (settled.applied) commitSave(settled.save);
       clearPendingRace();
 
       const s = saveRef.current;
@@ -397,7 +455,7 @@ export default function App() {
       // The first-run guide pauses the countdown until it is dismissed.
       if (needsTutorial) engineRef.current?.setPaused(true);
     },
-    []
+    [commitSave]
   );
 
   const handleNavigate = (target: ScreenId) => {
@@ -535,6 +593,71 @@ export default function App() {
     screen === 'playing'
   );
   const notice = saveNotice ?? storageError;
+
+  // Android hardware Back: one consistent priority order for every screen.
+  // A ref keeps the native listener registered exactly once while still seeing
+  // the latest React state on every press.
+  const backActionRef = useRef<() => boolean>(() => false);
+  backActionRef.current = () => {
+    if (pendingAdRef.current) {
+      finishPendingAd(false);
+      return true;
+    }
+    if (exitConfirm) {
+      setExitConfirm(false);
+      return true;
+    }
+    if (screen === 'playing') {
+      if (raceResult) {
+        commitPendingCrashIfNeeded();
+        setRaceResult(null);
+        setPaused(false);
+        engineRef.current?.setPaused(false);
+        setScreen('menu');
+        return true;
+      }
+      if (!paused) {
+        setPaused(true);
+        engineRef.current?.setPaused(true);
+        return true;
+      }
+      commitPendingCrashIfNeeded();
+      setPaused(false);
+      engineRef.current?.setPaused(false);
+      setScreen('menu');
+      return true;
+    }
+    if (screen === 'menu' || screen === 'splash') {
+      setExitConfirm(true);
+      return true;
+    }
+    setShopStatus(null);
+    handleNavigate('menu');
+    return true;
+  };
+
+  useEffect(() => {
+    return registerBackHandler(() => backActionRef.current());
+  }, []);
+
+  // Backgrounding must pause the race, silence audio and flush the save;
+  // resuming must not leave a suspended AudioContext or a frozen clock.
+  useEffect(() => {
+    return registerAppStateHandler((active) => {
+      if (!active) {
+        audioEngine.suspend();
+        engineRef.current?.setSuspended(true);
+        if (screen === 'playing' && !raceResult) {
+          setPaused(true);
+          engineRef.current?.setPaused(true);
+        }
+        persistSaveData(saveRef.current);
+      } else {
+        audioEngine.resume();
+        engineRef.current?.setSuspended(false);
+      }
+    });
+  }, [screen, raceResult]);
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-slate-950">
@@ -747,9 +870,18 @@ export default function App() {
           onStartPurchase={handleStartPurchase}
           onWatchFreeCoinsAd={() =>
             requestRewardedAd('free_coins_shop', () => {
-              const result = grantCoins(saveRef.current, FREE_COINS_REWARD);
-              if (result.applied) commitSave(result.save);
-              setShopStatus(t(saveRef.current.settings.language, 'adComplete'));
+              const result = claimFreeCoinsAdReward(saveRef.current, FREE_COINS_REWARD);
+              const currentLang = saveRef.current.settings.language;
+              if (result.applied) {
+                commitSave(result.save);
+                setShopStatus(t(currentLang, 'adComplete'));
+              } else if (result.reason === 'free-coins-daily-cap') {
+                setShopStatus(t(currentLang, 'freeCoinsCapReached'));
+              } else if (result.reason === 'free-coins-cooldown') {
+                setShopStatus(t(currentLang, 'freeCoinsCooldown'));
+              } else {
+                setShopStatus(t(currentLang, 'adNotCompleted'));
+              }
             })
           }
           onRestorePurchases={handleRestorePurchases}
@@ -796,6 +928,46 @@ export default function App() {
           onComplete={() => finishPendingAd(true)}
           onCancel={() => finishPendingAd(false)}
         />
+      )}
+
+      {/* Debug overlay — only wired when ?debug=1 or a dev build */}
+      {DEBUG_ENABLED && debugStats && screen === 'playing' && (
+        <div className="pointer-events-none fixed top-2 right-2 z-[70] rounded-lg bg-black/70 px-3 py-2 text-[10px] leading-snug text-emerald-300 font-mono">
+          <div>{Math.round(debugStats.fps)} FPS · {debugStats.frameTimeMs}ms</div>
+          <div>dc:{debugStats.drawCalls} tri:{debugStats.triangles}</div>
+          <div>g:{debugStats.geometries} t:{debugStats.textures} pr:{debugStats.pixelRatio.toFixed(2)}</div>
+          <div>q:{debugStats.qualitySetting} eff:{debugStats.effectiveQuality} scale:{debugStats.autoRenderScale.toFixed(2)}</div>
+        </div>
+      )}
+
+      {/* Android hardware-Back confirmation at the root screen */}
+      {exitConfirm && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/80 p-4">
+          <div className="w-full max-w-sm rounded-2xl border border-white/15 bg-slate-900 p-5 shadow-2xl">
+            <h2 className="mb-2 text-center text-lg font-black text-white">
+              {t(lang, 'exitTitle')}
+            </h2>
+            <p className="mb-5 text-center text-sm text-slate-300">{t(lang, 'gameTitle')}</p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setExitConfirm(false)}
+                className="flex-1 rounded-xl bg-slate-700 px-4 py-3 text-sm font-bold text-white cursor-pointer"
+              >
+                {t(lang, 'exitCancel')}
+              </button>
+              <button
+                onClick={() => {
+                  setExitConfirm(false);
+                  persistSaveData(saveRef.current);
+                  void exitApp();
+                }}
+                className="flex-1 rounded-xl bg-rose-600 px-4 py-3 text-sm font-bold text-white cursor-pointer"
+              >
+                {t(lang, 'exitConfirm')}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

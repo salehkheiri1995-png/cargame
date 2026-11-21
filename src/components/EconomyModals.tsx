@@ -726,6 +726,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             checked={settings.bloomEnabled}
             onChange={(v) => onUpdateSettings({ bloomEnabled: v })}
           />
+          <ToggleRow
+            label={t(lang, 'hapticsLabel')}
+            checked={settings.hapticsEnabled}
+            onChange={(v) => onUpdateSettings({ hapticsEnabled: v })}
+          />
+          <ToggleRow
+            label={t(lang, 'batterySaverLabel')}
+            checked={settings.batterySaver}
+            onChange={(v) => onUpdateSettings({ batterySaver: v })}
+          />
         </div>
 
         {/* Unity 6.3 & Cafe Bazaar Publishing Checklist */}

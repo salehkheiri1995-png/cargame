@@ -183,6 +183,9 @@ export class TurboRoadEngine {
   private paused = false;
   private raceFinished = false;
   private destroyed = false;
+  private suspended = false;
+  private batterySaver = false;
+  private lastStepTs = 0;
   private frameId = 0;
   private lastTimestamp = 0;
   private elapsedTotal = 0;
@@ -659,12 +662,43 @@ export class TurboRoadEngine {
     this.shakeScale = settings.reduceMotion
       ? 0
       : Math.max(0, Math.min(1.5, settings.shakeIntensity));
+    this.setBatterySaver(settings.batterySaver);
     this.postProcessor.setOptions({
       chromaticAberration: settings.chromaticAberration,
       filmGrain: settings.filmGrain,
       bloomEnabled: settings.bloomEnabled,
       reduceMotion: settings.reduceMotion,
     });
+  }
+
+  /** Caps the render/update loop at ~30 FPS without changing game speed. */
+  public setBatterySaver(enabled: boolean): void {
+    if (this.batterySaver === enabled) return;
+    this.batterySaver = enabled;
+    this.lastStepTs = 0;
+    this.lastTimestamp = performance.now();
+  }
+
+  /**
+   * Stops scheduling frames while the Android app is in the background. This
+   * keeps the GPU/CPU idle instead of relying on browser rAF throttling.
+   */
+  public setSuspended(suspended: boolean): void {
+    if (this.suspended === suspended || this.destroyed) return;
+    this.suspended = suspended;
+    this.lastTimestamp = performance.now();
+    this.lastStepTs = 0;
+    if (suspended) {
+      cancelAnimationFrame(this.frameId);
+      clearTimeout(this.frameId);
+      this.frameId = 0;
+      this.resetInputs();
+      audioEngine.updateEngine(0, false, false);
+    } else {
+      cancelAnimationFrame(this.frameId);
+      clearTimeout(this.frameId);
+      this.frameId = requestAnimationFrame(this.tick);
+    }
   }
 
   /**
@@ -2673,7 +2707,16 @@ export class TurboRoadEngine {
   }
 
   private tick = (now = performance.now()): void => {
-    if (this.destroyed) return;
+    if (this.destroyed || this.suspended) return;
+    if (this.batterySaver) {
+      // 30 FPS cap: skip the whole step (not just the draw) so a weak phone
+      // spends roughly half the CPU/GPU time while game speed stays correct.
+      if (this.lastStepTs > 0 && now - this.lastStepTs < 32) {
+        this.frameId = requestAnimationFrame(this.tick);
+        return;
+      }
+      this.lastStepTs = now;
+    }
     const rawDt = (now - this.lastTimestamp) / 1000;
     this.lastTimestamp = now;
     const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
@@ -2785,11 +2828,14 @@ export class TurboRoadEngine {
   };
 
   private handleVisibilityChange = (): void => {
+    const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
     this.lastTimestamp = performance.now();
     this.qualityCooldown = 2;
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    if (hidden) {
       this.resetInputs();
     }
+    // Browsers and Android WebView both report hidden when backgrounded.
+    this.setSuspended(hidden);
   };
 
   private handleContextLost = (e: Event): void => {

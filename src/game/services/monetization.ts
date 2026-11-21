@@ -4,10 +4,12 @@ import {
   adProvider,
   billingProvider,
   monetizationMode,
+  providerKind,
   type AdOutcome,
   type AdProvider,
   type AdSession,
   type BillingProvider,
+  type ProviderKind,
   type PurchaseOutcome,
   type RestoreOutcome,
   type RewardedPlacement,
@@ -18,6 +20,7 @@ export {
   adProvider,
   billingProvider,
   monetizationMode,
+  providerKind,
 } from './providers';
 
 /**
@@ -40,6 +43,41 @@ class MonetizationService {
 
   public get isSandbox(): boolean {
     return billingProvider.isSandbox || adProvider.isSandbox;
+  }
+
+  /** 'sandbox' | 'native' | 'unavailable' — for honest UI labels. */
+  public get providerKind(): ProviderKind {
+    return providerKind;
+  }
+
+  /**
+   * Native ad SDKs own the fullscreen UI. When this is true callers must await
+   * `showRewardedAsync` and skip the React countdown overlay entirely.
+   */
+  public get hasNativeAds(): boolean {
+    return typeof adProvider.showRewarded === 'function';
+  }
+
+  public async showRewardedAsync(placement: RewardedPlacement): Promise<AdOutcome> {
+    if (!adProvider.showRewarded) {
+      return { status: 'unavailable', placement, sandbox: false };
+    }
+    try {
+      return await adProvider.showRewarded(placement);
+    } catch {
+      return { status: 'failed', placement, sandbox: false, error: 'ad-exception' };
+    }
+  }
+
+  public async showInterstitialAsync(): Promise<AdOutcome> {
+    if (!adProvider.showInterstitial) {
+      return { status: 'unavailable', placement: 'continue_level', sandbox: false };
+    }
+    try {
+      return await adProvider.showInterstitial();
+    } catch {
+      return { status: 'failed', placement: 'continue_level', sandbox: false, error: 'ad-exception' };
+    }
   }
 
   public get billing(): BillingProvider {

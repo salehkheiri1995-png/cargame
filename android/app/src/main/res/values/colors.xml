@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Turbo Road dark shell (matches the in-game background #070b14). -->
+    <color name="colorPrimary">#070b14</color>
+    <color name="colorPrimaryDark">#05070d</color>
+    <color name="colorAccent">#38bdf8</color>
+    <color name="backgroundDark">#070b14</color>
+</resources>

@@ -56,6 +56,29 @@ class TurboAudioEngine {
     this.ensureContext();
   }
 
+  /** Called when the app goes to the background (Capacitor/WebView). */
+  public suspend(): void {
+    if (this.musicTimer !== null) {
+      window.clearInterval(this.musicTimer);
+      this.musicTimer = null;
+    }
+    if (this.ctx && this.ctx.state === 'running') {
+      void this.ctx.suspend().catch(() => undefined);
+    }
+  }
+
+  /** Called when the app returns to the foreground; restarts music safely. */
+  public resume(): void {
+    if (this.ctx && this.ctx.state === 'suspended') {
+      void this.ctx.resume().catch(() => undefined);
+    }
+    const mode = this.musicMode;
+    if (mode !== 'none') {
+      this.musicMode = 'none';
+      this.setMusicMode(mode);
+    }
+  }
+
   public setVolumes(musicVol: number, sfxVol: number): void {
     this.musicVolume = Math.max(0, Math.min(1, musicVol));
     this.sfxVolume = Math.max(0, Math.min(1, sfxVol));

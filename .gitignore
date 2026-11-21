@@ -6,3 +6,18 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Android / Capacitor local config — never commit machine-local or secret files
+android/.gradle/
+android/local.properties
+android/build/
+android/app/build/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+*.keystore
+*.jks
+*.p12
+keystore.properties
+android/keystore.properties
+android/app/release/

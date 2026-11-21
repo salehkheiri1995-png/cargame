@@ -11,7 +11,12 @@ import type {
   VehicleUpgradeLevels,
 } from '../types';
 import type { PurchaseOutcome, PurchaseStatus } from './providers';
-import { MAX_COINS } from './saveSystem';
+import {
+  FREE_COIN_AD_COOLDOWN_MS,
+  FREE_COIN_AD_DAILY_CAP,
+  getTodayKey,
+  MAX_COINS,
+} from './saveSystem';
 
 export type EconomyRejectReason =
   | 'unknown-car'
@@ -24,7 +29,9 @@ export type EconomyRejectReason =
   | 'unknown-sku'
   | 'duplicate-transaction'
   | 'already-owned-entitlement'
-  | 'invalid-transaction';
+  | 'invalid-transaction'
+  | 'free-coins-daily-cap'
+  | 'free-coins-cooldown';
 
 export interface EconomyResult {
   save: SaveData;
@@ -149,6 +156,42 @@ export function grantCoins(save: SaveData, amount: number): EconomyResult {
   const safe = Math.floor(amount);
   if (!Number.isFinite(safe) || safe <= 0) return { save, applied: false };
   return { save: { ...save, coins: clampCoins(save.coins + safe) }, applied: true };
+}
+
+/**
+ * Rewarded "free coins" in the shop is repeatable, so it needs its own
+ * anti-farm budget. The counter lives in the v3 save and is migrated in place
+ * (no reset of any other progress). A duplicated ad callback is also blocked by
+ * the cooldown, and the cap resets naturally on a new local day.
+ */
+export function claimFreeCoinsAdReward(
+  save: SaveData,
+  amount: number,
+  now = new Date()
+): EconomyResult {
+  const safe = Math.floor(amount);
+  if (!Number.isFinite(safe) || safe <= 0) return { save, applied: false };
+  const today = getTodayKey(now);
+  const sameDay = save.freeCoinAdDay === today;
+  const count = sameDay ? Math.max(0, Math.floor(save.freeCoinAdCount)) : 0;
+  if (count >= FREE_COIN_AD_DAILY_CAP) {
+    return { save, applied: false, reason: 'free-coins-daily-cap' };
+  }
+  const lastAt = sameDay ? Math.max(0, Math.floor(save.freeCoinAdLastAt)) : 0;
+  const nowMs = now.getTime();
+  if (lastAt > 0 && nowMs >= lastAt && nowMs - lastAt < FREE_COIN_AD_COOLDOWN_MS) {
+    return { save, applied: false, reason: 'free-coins-cooldown' };
+  }
+  return {
+    save: {
+      ...save,
+      coins: clampCoins(save.coins + safe),
+      freeCoinAdDay: today,
+      freeCoinAdCount: count + 1,
+      freeCoinAdLastAt: nowMs,
+    },
+    applied: true,
+  };
 }
 
 /* ------------------------------------------------------------------ */

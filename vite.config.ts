@@ -6,6 +6,9 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Relative base so the built app works inside the Capacitor WebView
+    // (file:// / https://androidapp.local) as well as on any static host.
+    base: './',
     plugins: [
       react(),
       tailwindcss(),

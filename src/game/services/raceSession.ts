@@ -38,6 +38,31 @@ export function startNewRace(previous: RaceSession | null, now = Date.now()): Ra
 }
 
 /**
+ * Starts a fresh race without leaking an unresolved revive offer.
+ *
+ * `launchRace` can be called from the pause menu or the Android Back flow while
+ * the previous crash is still `awaiting-revive`. If we simply replaced the
+ * session, that crash would never be banked (lost reward) and its pending-race
+ * record could later be settled by a reload (surprise reward). Declining and
+ * settling first is the single consistent rule for every exit path.
+ */
+export function settleBeforeNewRace(
+  previous: RaceSession | null,
+  save: SaveData,
+  now = new Date()
+): { session: RaceSession; save: SaveData; applied: boolean } {
+  if (previous && previous.phase === 'awaiting-revive') {
+    const settlement = settleSession(declineRevive(previous), save, now);
+    return {
+      session: startNewRace(settlement.session, now.getTime()),
+      save: settlement.save,
+      applied: settlement.applied,
+    };
+  }
+  return { session: startNewRace(previous, now.getTime()), save, applied: false };
+}
+
+/**
  * Records the terminal payload. Repeated engine callbacks for the same race are
  * ignored; a crash that still offers a revive parks the session instead of banking it.
  */

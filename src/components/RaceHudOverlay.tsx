@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { TOTAL_LEVELS } from '../game/data/levels';
 import { formatMissionGoal, formatNumber, getMissionTypeLabel, t } from '../game/i18n';
+import { hapticImpact } from '../game/services/haptics';
 import type {
   ActiveRaceConfig,
   ControlScheme,
@@ -49,13 +50,9 @@ interface RaceHudOverlayProps {
 }
 
 const triggerHaptic = (ms = 10) => {
-  if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-    try {
-      navigator.vibrate(ms);
-    } catch {
-      // ignore unsupported browsers
-    }
-  }
+  // Strength is derived from the legacy duration so existing call sites keep
+  // their feel; the shared service handles native vs. web and the user setting.
+  void hapticImpact(ms >= 20 ? 'heavy' : ms >= 12 ? 'medium' : 'light');
 };
 
 export const RaceHudOverlay: React.FC<RaceHudOverlayProps> = ({
